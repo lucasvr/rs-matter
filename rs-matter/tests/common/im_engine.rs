@@ -149,7 +149,7 @@ pub struct ImOutput {
 }
 
 pub struct ImEngineHandler<'a> {
-    handler: handler_chain_type!(OnOffCluster, EchoCluster, DescriptorCluster<'static>, EchoCluster | EthRootEndpointHandler<'a>),
+    handler: handler_chain_type!(OnOffCluster<'a>, EchoCluster, DescriptorCluster<'static>, EchoCluster | EthRootEndpointHandler<'a>),
 }
 
 impl<'a> ImEngineHandler<'a> {
@@ -173,7 +173,7 @@ impl<'a> ImEngineHandler<'a> {
             .chain(
                 1,
                 cluster_on_off::ID,
-                OnOffCluster::new(Dataver::new_rand(matter.rand())),
+                OnOffCluster::new(Dataver::new_rand(matter.rand()), None),
             );
 
         Self { handler }

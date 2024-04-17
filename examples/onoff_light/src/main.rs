@@ -107,7 +107,7 @@ fn run() -> Result<(), Error> {
 
     let mut mdns = pin!(run_mdns(&matter));
 
-    let on_off = cluster_on_off::OnOffCluster::new(Dataver::new_rand(matter.rand()));
+    let on_off = cluster_on_off::OnOffCluster::new(Dataver::new_rand(matter.rand()), None);
 
     let subscriptions = Subscriptions::<3>::new();
 
