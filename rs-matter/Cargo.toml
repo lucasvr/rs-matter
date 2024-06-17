@@ -38,7 +38,7 @@ owo-colors = "4"
 time = { version = "0.3", default-features = false }
 verhoeff = { version = "1", default-features = false }
 embassy-futures = "0.1"
-embassy-time = "0.3"
+embassy-time = { version = "0.3", optional = true }
 embassy-sync = "0.5"
 critical-section = "1.1"
 domain = { version = "0.9", default-features = false, features = ["heapless"] }
@@ -67,6 +67,9 @@ x509-cert = { version = "0.2", default-features = false, features = ["pem"], opt
 # STD
 rand = { version = "0.8", optional = true, default-features = false, features = ["std", "std_rng"] }
 async-io = { version = "2", optional = true, default-features = false }
+
+# OS
+kernel = { path = "../../../../kernel" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 astro-dnssd = { version = "0.3" }

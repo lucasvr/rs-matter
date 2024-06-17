@@ -18,10 +18,11 @@
 use core::borrow::Borrow;
 use core::mem::MaybeUninit;
 use core::pin::pin;
+use kernel::time::Duration;
+use kernel::thread::Thread;
 
 use embassy_futures::select::{select, select_slice, Either};
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, channel::Channel};
-use embassy_time::{Duration, Timer};
 
 use log::{error, info, warn};
 
@@ -508,9 +509,16 @@ impl<'a> Matter<'a> {
     }
 
     pub async fn wait_tx(&self) -> Result<(), Error> {
+        async fn wait_timeout(t: Duration) {
+            for _ in 0..10 {
+                Thread::current().sleep(t / 10);
+                embassy_futures::yield_now().await;
+            }
+        }
+
         select(
             self.send_notification.wait(),
-            Timer::after(Duration::from_millis(100)),
+            wait_timeout(Duration::from_millis(100))
         )
         .await;
 

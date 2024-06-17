@@ -1,4 +1,5 @@
 use core::{borrow::Borrow, cell::RefCell};
+use alloc::boxed::Box;
 
 use crate::{
     acl::AclMgr,
@@ -75,6 +76,7 @@ where
         + Borrow<dyn Mdns + 'a>
         + Borrow<Epoch>
         + Borrow<Rand>
+        + Borrow<Option<Box<dyn Fn()>>>
         + 'a,
 {
     wrap(
@@ -88,6 +90,7 @@ where
         matter.borrow(),
         *matter.borrow(),
         *matter.borrow(),
+        matter.borrow(),
     )
 }
 
@@ -103,6 +106,7 @@ pub fn wrap<'a>(
     mdns: &'a dyn Mdns,
     epoch: Epoch,
     rand: Rand,
+    clear_display_callback: &'a Option<Box<dyn Fn()>>,
 ) -> RootEndpointHandler<'a> {
     EmptyHandler
         .chain(
@@ -139,7 +143,7 @@ pub fn wrap<'a>(
         .chain(
             endpoint_id,
             general_commissioning::ID,
-            GenCommCluster::new(failsafe, rand),
+            GenCommCluster::new(failsafe, rand, clear_display_callback),
         )
         .chain(
             endpoint_id,

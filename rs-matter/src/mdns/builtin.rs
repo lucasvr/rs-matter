@@ -1,9 +1,10 @@
 use core::{cell::RefCell, pin::pin};
+use kernel::time::Duration;
+use super::wait::wait_timeout;
 
 use embassy_futures::select::select;
 use embassy_sync::blocking_mutex::raw::{NoopRawMutex, RawMutex};
 use embassy_sync::mutex::Mutex;
-use embassy_time::{Duration, Timer};
 use log::{info, warn};
 
 use crate::data_model::cluster_basic_information::BasicInfoConfig;
@@ -131,7 +132,7 @@ impl<'a> MdnsImpl<'a> {
         loop {
             select(
                 self.notification.wait(),
-                Timer::after(Duration::from_secs(30)),
+                wait_timeout(kernel::time::Duration::from_secs(30)),
             )
             .await;
 

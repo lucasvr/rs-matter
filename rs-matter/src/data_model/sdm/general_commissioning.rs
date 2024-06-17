@@ -16,7 +16,7 @@
  */
 
 use core::cell::RefCell;
-
+use alloc::boxed::Box;
 use crate::data_model::objects::*;
 use crate::data_model::sdm::failsafe::FailSafe;
 use crate::tlv::{FromTLV, TLVElement, ToTLV, UtfStr};
@@ -130,10 +130,15 @@ pub struct GenCommCluster<'a> {
     data_ver: Dataver,
     basic_comm_info: BasicCommissioningInfo,
     failsafe: &'a RefCell<FailSafe>,
+    clear_display_callback: &'a Option<Box<dyn Fn()>>,
 }
 
 impl<'a> GenCommCluster<'a> {
-    pub fn new(failsafe: &'a RefCell<FailSafe>, rand: Rand) -> Self {
+    pub fn new(
+        failsafe: &'a RefCell<FailSafe>,
+        rand: Rand,
+        clear_display_callback: &'a Option<Box<dyn Fn()>>
+    ) -> Self {
         Self {
             data_ver: Dataver::new(rand),
             failsafe,
@@ -142,6 +147,7 @@ impl<'a> GenCommCluster<'a> {
                 expiry_len: 120,
                 max_cmltv_failsafe_secs: 120,
             },
+            clear_display_callback,
         }
     }
 
@@ -295,6 +301,10 @@ impl<'a> GenCommCluster<'a> {
         encoder
             .with_command(RespCommands::CommissioningCompleteResp as _)?
             .set(cmd_data)?;
+
+        if let Some(callback) = self.clear_display_callback {
+            callback();
+        }
 
         Ok(())
     }

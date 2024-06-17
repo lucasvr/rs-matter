@@ -69,6 +69,8 @@ pub struct Matter<'a> {
     pub(crate) ephemeral: RefCell<Option<ExchangeCtx>>,
     pub(crate) ephemeral_mutex: Mutex<NoopRawMutex, ()>,
     pub session_mgr: RefCell<SessionMgr>, // Public for tests
+    pub display_qrcode_callback: Option<Box<dyn Fn(&str)>>,
+    pub clear_display_callback: Option<Box<dyn Fn()>>,
 }
 
 impl<'a> Matter<'a> {
@@ -120,7 +122,18 @@ impl<'a> Matter<'a> {
             ephemeral: RefCell::new(None),
             ephemeral_mutex: Mutex::new(()),
             session_mgr: RefCell::new(SessionMgr::new(epoch, rand)),
+            display_qrcode_callback: None,
+            clear_display_callback: None,
         }
+    }
+
+    pub fn set_callbacks(
+        &mut self,
+        display_qrcode_callback: Option<Box<dyn Fn(&str)>>,
+        clear_display_callback: Option<Box<dyn Fn()>>,
+    ) {
+        self.display_qrcode_callback = display_qrcode_callback;
+        self.clear_display_callback = clear_display_callback;
     }
 
     pub fn dev_det(&self) -> &BasicInfoConfig<'_> {
@@ -167,6 +180,7 @@ impl<'a> Matter<'a> {
                 &dev_comm,
                 DiscoveryCapabilities::default(),
                 buf,
+                &self.display_qrcode_callback,
             )?;
 
             self.pase_mgr.borrow_mut().enable_pase_session(
@@ -243,5 +257,11 @@ impl<'a> Borrow<Epoch> for Matter<'a> {
 impl<'a> Borrow<Rand> for Matter<'a> {
     fn borrow(&self) -> &Rand {
         &self.rand
+    }
+}
+
+impl<'a> Borrow<Option<Box<dyn Fn()>>> for Matter<'a> {
+    fn borrow(&self) -> &Option<Box<dyn Fn()>> {
+        &self.clear_display_callback
     }
 }

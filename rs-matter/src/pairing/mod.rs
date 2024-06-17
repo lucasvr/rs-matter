@@ -23,6 +23,7 @@ pub mod vendor_identifiers;
 
 use log::info;
 use verhoeff::Verhoeff;
+use alloc::boxed::Box;
 
 use crate::{
     codec::base38, data_model::cluster_basic_information::BasicInfoConfig, error::Error,
@@ -86,6 +87,7 @@ pub fn print_pairing_code_and_qr(
     comm_data: &CommissioningData,
     discovery_capabilities: DiscoveryCapabilities,
     buf: &mut [u8],
+    display_qrcode_callback: &Option<Box<dyn Fn(&str)>>,
 ) -> Result<(), Error> {
     let pairing_code = compute_pairing_code(comm_data);
     pretty_print_pairing_code(&pairing_code);
@@ -93,6 +95,11 @@ pub fn print_pairing_code_and_qr(
     let (qr_code, remaining_buf) =
         compute_qr_code_text(dev_det, comm_data, discovery_capabilities, &[], buf)?;
     print_qr_code(qr_code, remaining_buf)?;
+
+    // Invoke the callback to display the QR code on a display, if available
+    if let Some(callback) = display_qrcode_callback {
+        callback(qr_code);
+    }
 
     Ok(())
 }
