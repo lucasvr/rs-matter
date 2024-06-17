@@ -1,5 +1,6 @@
 use crate::handler_chain_type;
 use crate::utils::rand::Rand;
+use alloc::boxed::Box;
 
 use super::cluster_basic_information::{self, BasicInfoCluster};
 use super::objects::{Cluster, Dataver, EmptyHandler, Endpoint, EndptId, HandlerCompat};
@@ -106,6 +107,7 @@ pub fn handler<NWCOMM, NWDIAG>(
     nwdiag: NWDIAG,
     supports_concurrent_connection: bool,
     rand: Rand,
+    clear_display_callback: &'a Option<Box<dyn Fn()>>,
 ) -> RootEndpointHandler<'static, NWCOMM, NWDIAG> {
     wrap(
         endpoint_id,
@@ -114,6 +116,7 @@ pub fn handler<NWCOMM, NWDIAG>(
         nwdiag,
         supports_concurrent_connection,
         rand,
+        clear_display_callback,
     )
 }
 
@@ -124,6 +127,7 @@ fn wrap<NWCOMM, NWDIAG>(
     nwdiag: NWDIAG,
     supports_concurrent_connection: bool,
     rand: Rand,
+    clear_display_callback: &'a Option<Box<dyn Fn()>>,
 ) -> RootEndpointHandler<'static, NWCOMM, NWDIAG> {
     EmptyHandler
         .chain(
@@ -158,6 +162,7 @@ fn wrap<NWCOMM, NWDIAG>(
                 Dataver::new_rand(rand),
                 BasicCommissioningInfo::new(),
                 supports_concurrent_connection,
+                clear_display_callback,
             )),
         )
         .chain(

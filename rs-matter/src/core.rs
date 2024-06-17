@@ -62,6 +62,8 @@ pub struct Matter<'a> {
     dev_det: &'a BasicInfoConfig<'a>,
     dev_att: &'a dyn DevAttDataFetcher,
     port: u16,
+    pub display_qrcode_callback: Option<Box<dyn Fn(&str)>>,
+    pub clear_display_callback: Option<Box<dyn Fn()>>,
 }
 
 impl<'a> Matter<'a> {
@@ -106,11 +108,22 @@ impl<'a> Matter<'a> {
             dev_det,
             dev_att,
             port,
+            display_qrcode_callback: None,
+            clear_display_callback: None,
         }
     }
 
     pub fn initialize_transport_buffers(&self) -> Result<(), Error> {
         self.transport_mgr.initialize_buffers()
+    }
+
+    pub fn set_callbacks(
+        &mut self,
+        display_qrcode_callback: Option<Box<dyn Fn(&str)>>,
+        clear_display_callback: Option<Box<dyn Fn()>>,
+    ) {
+        self.display_qrcode_callback = display_qrcode_callback;
+        self.clear_display_callback = clear_display_callback;
     }
 
     pub fn dev_det(&self) -> &BasicInfoConfig<'_> {
@@ -203,7 +216,13 @@ impl<'a> Matter<'a> {
     ) -> Result<bool, Error> {
         if !self.pase_mgr.borrow().is_pase_session_enabled() && self.fabric_mgr.borrow().is_empty()
         {
-            print_pairing_code_and_qr(self.dev_det, &dev_comm, discovery_capabilities, buf)?;
+            print_pairing_code_and_qr(
+                self.dev_det,
+                &dev_comm,
+                discovery_capabilities,
+                buf,
+                &self.display_qrcode_callback,
+            )?;
 
             self.pase_mgr.borrow_mut().enable_pase_session(
                 dev_comm.verifier,

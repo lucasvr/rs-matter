@@ -15,8 +15,8 @@
  *    limitations under the License.
  */
 
+use alloc::boxed::Box;
 use log::info;
-
 use rs_matter_macros::idl_import;
 
 use strum::{EnumDiscriminants, FromRepr};
@@ -131,22 +131,25 @@ impl Default for BasicCommissioningInfo {
 }
 
 #[derive(Debug, Clone)]
-pub struct GenCommCluster {
+pub struct GenCommCluster<'a> {
     data_ver: Dataver,
     basic_comm_info: BasicCommissioningInfo,
     supports_concurrent_connection: bool,
+    clear_display_callback: &'a Option<Box<dyn Fn()>>,
 }
 
-impl GenCommCluster {
+impl<'a> GenCommCluster<'a> {
     pub const fn new(
         data_ver: Dataver,
         basic_comm_info: BasicCommissioningInfo,
         supports_concurrent_connection: bool,
+        clear_display_callback: &'a Option<Box<dyn Fn()>>,
     ) -> Self {
         Self {
             data_ver,
             basic_comm_info,
             supports_concurrent_connection,
+            clear_display_callback,
         }
     }
 
@@ -306,11 +309,15 @@ impl GenCommCluster {
             .with_command(RespCommands::CommissioningCompleteResp as _)?
             .set(cmd_data)?;
 
+        if let Some(callback) = self.clear_display_callback {
+            callback();
+        }
+
         Ok(())
     }
 }
 
-impl Handler for GenCommCluster {
+impl<'a> Handler for GenCommCluster<'a> {
     fn read(
         &self,
         exchange: &Exchange,
@@ -331,9 +338,9 @@ impl Handler for GenCommCluster {
     }
 }
 
-impl NonBlockingHandler for GenCommCluster {}
+impl<'a> NonBlockingHandler for GenCommCluster<'a> {}
 
-impl ChangeNotifier<()> for GenCommCluster {
+impl<'a> ChangeNotifier<()> for GenCommCluster<'a> {
     fn consume_change(&mut self) -> Option<()> {
         self.data_ver.consume_change(())
     }
