@@ -89,6 +89,7 @@ pub mod secure_channel;
 pub mod tlv;
 pub mod transport;
 pub mod utils;
+mod wait;
 
 pub use crate::core::*;
 
