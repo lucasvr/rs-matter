@@ -1,27 +1,24 @@
-use core::{cell::RefCell, pin::pin};
-use kernel::time::{Instant, Duration};
-use crate::wait::wait_timeout;
-
-use embassy_futures::select::select;
-use embassy_sync::blocking_mutex::raw::{NoopRawMutex, RawMutex};
-use embassy_sync::mutex::Mutex;
-use log::{info, warn};
-
+use self::proto::Services;
+use super::{Service, ServiceMode};
 use crate::data_model::cluster_basic_information::BasicInfoConfig;
 use crate::error::{Error, ErrorCode};
 use crate::transport::network::{
     Address, Ipv4Addr, Ipv6Addr, NetworkReceive, NetworkSend, SocketAddr, SocketAddrV4,
     SocketAddrV6,
 };
-use crate::utils::{
-    buf::BufferAccess,
-    select::{EitherUnwrap, Notification},
-};
-
-use super::{Service, ServiceMode};
-
-use self::proto::Services;
-
+use crate::utils::buf::BufferAccess;
+use crate::utils::notification::Notification;
+use crate::utils::rand::Rand;
+use crate::utils::select::Coalesce;
+use crate::wait::wait_timeout;
+use core::cell::RefCell;
+use core::net::IpAddr;
+use core::pin::pin;
+use embassy_futures::select::select;
+use embassy_sync::blocking_mutex::raw::{NoopRawMutex, RawMutex};
+use embassy_sync::mutex::Mutex;
+use kernel::time::{Duration, Instant};
+use log::{info, warn};
 pub use proto::Host;
 
 #[path = "proto.rs"]
@@ -39,7 +36,7 @@ pub struct MdnsImpl<'a> {
     dev_det: &'a BasicInfoConfig<'a>,
     matter_port: u16,
     services: RefCell<heapless::Vec<(heapless::String<40>, ServiceMode), 4>>,
-    notification: Notification,
+    notification: Notification<NoopRawMutex>,
 }
 
 impl<'a> MdnsImpl<'a> {
@@ -65,7 +62,7 @@ impl<'a> MdnsImpl<'a> {
             .push((service.try_into().unwrap(), mode))
             .map_err(|_| ErrorCode::NoSpace)?;
 
-        self.notification.signal(());
+        self.notification.notify();
 
         Ok(())
     }
@@ -75,7 +72,7 @@ impl<'a> MdnsImpl<'a> {
 
         services.retain(|(name, _)| name != service);
 
-        self.notification.signal(());
+        self.notification.notify();
 
         Ok(())
     }
@@ -95,27 +92,29 @@ impl<'a> MdnsImpl<'a> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn run<S, R, SB, RB>(
         &self,
         send: S,
         recv: R,
         tx_buf: SB,
         rx_buf: RB,
-        host: Host<'_>,
+        host: &Host<'_>,
         interface: Option<u32>,
+        rand: Rand,
     ) -> Result<(), Error>
     where
         S: NetworkSend,
         R: NetworkReceive,
-        SB: BufferAccess,
-        RB: BufferAccess,
+        SB: BufferAccess<[u8]>,
+        RB: BufferAccess<[u8]>,
     {
         let send = Mutex::<NoopRawMutex, _>::new(send);
 
-        let mut broadcast = pin!(self.broadcast(&send, &tx_buf, &host, interface));
-        let mut respond = pin!(self.respond(&send, recv, &tx_buf, &rx_buf, &host, interface));
+        let mut broadcast = pin!(self.broadcast(&send, &tx_buf, host, interface));
+        let mut respond = pin!(self.respond(&send, recv, &tx_buf, &rx_buf, host, interface, rand));
 
-        select(&mut broadcast, &mut respond).await.unwrap()
+        select(&mut broadcast, &mut respond).coalesce().await
     }
 
     async fn broadcast<S, B>(
@@ -127,7 +126,7 @@ impl<'a> MdnsImpl<'a> {
     ) -> Result<(), Error>
     where
         S: NetworkSend,
-        B: BufferAccess,
+        B: BufferAccess<[u8]>,
     {
         loop {
             select(
@@ -152,7 +151,7 @@ impl<'a> MdnsImpl<'a> {
                     })
                     .into_iter(),
             ) {
-                let mut buf = buffer.get().await;
+                let mut buf = buffer.get().await.ok_or(ErrorCode::NoSpace)?;
                 let mut send = send.lock().await;
 
                 let len = host.broadcast(self, &mut buf, 60)?;
@@ -165,6 +164,7 @@ impl<'a> MdnsImpl<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn respond<S, R, SB, RB>(
         &self,
         send: &Mutex<impl RawMutex, S>,
@@ -172,39 +172,78 @@ impl<'a> MdnsImpl<'a> {
         tx_buf: SB,
         rx_buf: RB,
         host: &Host<'_>,
-        _interface: Option<u32>,
+        interface: Option<u32>,
+        rand: Rand,
     ) -> Result<(), Error>
     where
         S: NetworkSend,
         R: NetworkReceive,
-        SB: BufferAccess,
-        RB: BufferAccess,
+        SB: BufferAccess<[u8]>,
+        RB: BufferAccess<[u8]>,
     {
         loop {
             recv.wait_available().await?;
 
             {
-                let mut rx = rx_buf.get().await;
+                let mut rx = rx_buf.get().await.ok_or(ErrorCode::NoSpace)?;
                 let (len, addr) = recv.recv_from(&mut rx).await?;
 
-                let mut tx = tx_buf.get().await;
+                let mut tx = tx_buf.get().await.ok_or(ErrorCode::NoSpace)?;
                 let mut send = send.lock().await;
 
-                let len = match host.respond(self, &rx[..len], &mut tx, 60) {
-                    Ok(len) => len,
-                    Err(err) => match err.code() {
-                        ErrorCode::MdnsError => {
-                            warn!("Got invalid message from {addr}, skipping");
-                            continue;
-                        }
-                        other => Err(other)?,
-                    },
+                let (len, delay) = match host.respond(self, &rx[..len], &mut tx, 60) {
+                    Ok((len, delay)) => (len, delay),
+                    Err(err) => {
+                        warn!("mDNS protocol error {err} while replying to {addr}");
+                        continue;
+                    }
                 };
 
                 if len > 0 {
-                    info!("Replying to mDNS query from {}", addr);
+                    let ipv4 = addr
+                        .udp()
+                        .map(|addr| matches!(addr.ip(), IpAddr::V4(_)))
+                        .unwrap_or(true);
 
-                    send.send_to(&tx[..len], addr).await?;
+                    let reply_addr = if ipv4 {
+                        Some(SocketAddr::V4(SocketAddrV4::new(
+                            MDNS_IPV4_BROADCAST_ADDR,
+                            MDNS_PORT,
+                        )))
+                    } else {
+                        interface.map(|interface| {
+                            SocketAddr::V6(SocketAddrV6::new(
+                                MDNS_IPV6_BROADCAST_ADDR,
+                                MDNS_PORT,
+                                0,
+                                interface,
+                            ))
+                        })
+                    };
+
+                    if let Some(reply_addr) = reply_addr {
+                        if delay {
+                            let mut b = [0];
+                            rand(&mut b);
+
+                            // Generate a delay between 20 and 120 ms, as per spec
+                            let delay_ms = 20 + (b[0] as u32 * 100 / 256);
+
+                            info!(
+                                "Replying to mDNS query from {addr} on {reply_addr}, delay {delay_ms}ms"
+                            );
+                            wait_timeout(Instant::now() + Duration::from_millis(delay_ms as _))
+                                .await;
+                        } else {
+                            info!("Replying to mDNS query from {addr} on {reply_addr}");
+                        }
+
+                        send.send_to(&tx[..len], Address::Udp(reply_addr)).await?;
+                    } else {
+                        info!(
+                            "Cannot reply to mDNS query from {addr}: no suitable broadcast address found"
+                        );
+                    }
                 }
             }
         }

@@ -15,23 +15,20 @@
  *    limitations under the License.
  */
 
-use core::cell::Cell;
-
 use super::objects::*;
-use crate::{
-    attribute_enum, cmd_enter, command_enum, error::Error, tlv::TLVElement,
-    transport::exchange::Exchange, utils::rand::Rand,
-};
+use crate::error::Error;
+use crate::tlv::TLVElement;
+use crate::transport::exchange::Exchange;
+use crate::utils::rand::Rand;
+use crate::{attribute_enum, cmd_enter, command_enum};
+use core::cell::Cell;
 use log::info;
 use rs_matter_macros::idl_import;
 use strum::{EnumDiscriminants, FromRepr};
 
 idl_import!(clusters = ["OnOff"]);
 
-pub use on_off::ID;
-
-pub use on_off::Commands;
-pub use on_off::CommandsDiscriminants;
+pub use on_off::{Commands, CommandsDiscriminants, ID};
 
 #[derive(FromRepr, EnumDiscriminants)]
 #[repr(u16)]
@@ -61,6 +58,7 @@ pub const CLUSTER: Cluster<'static> = Cluster {
     ],
 };
 
+#[derive(Clone)]
 pub struct OnOffCluster<'a> {
     data_ver: Dataver,
     on: Cell<bool>,
@@ -74,6 +72,10 @@ impl<'a> OnOffCluster<'a> {
             on: Cell::new(false),
             callback,
         }
+    }
+
+    pub fn get(&self) -> bool {
+        self.on.get()
     }
 
     pub fn set(&self, on: bool) {

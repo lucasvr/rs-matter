@@ -15,7 +15,8 @@
  *    limitations under the License.
  */
 
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
+use core::num::NonZeroU8;
 
 use crate::acl::{AclEntry, AclMgr, AuthMode};
 use crate::cert::{Cert, MAX_CERT_TLV_LEN};
@@ -25,13 +26,14 @@ use crate::data_model::sdm::dev_att;
 use crate::fabric::{Fabric, FabricMgr, MAX_SUPPORTED_FABRICS};
 use crate::mdns::Mdns;
 use crate::tlv::{FromTLV, OctetStr, TLVElement, TLVWriter, TagType, ToTLV, UtfStr};
+use crate::transport::core::TransportMgr;
 use crate::transport::exchange::Exchange;
 use crate::transport::session::SessionMode;
 use crate::utils::epoch::Epoch;
 use crate::utils::rand::Rand;
 use crate::utils::writebuf::WriteBuf;
 use crate::{attribute_enum, cmd_enter, command_enum, error::*};
-use log::{error, info};
+use log::{error, info, warn};
 use strum::{EnumDiscriminants, FromRepr};
 
 use super::dev_att::{DataType, DevAttDataFetcher};
@@ -210,9 +212,10 @@ struct CertChainReq {
 
 #[derive(FromTLV)]
 struct RemoveFabricReq {
-    fab_idx: u8,
+    fab_idx: NonZeroU8,
 }
 
+#[derive(Clone)]
 pub struct NocCluster<'a> {
     data_ver: Dataver,
     epoch: Epoch,
@@ -221,15 +224,18 @@ pub struct NocCluster<'a> {
     fabric_mgr: &'a RefCell<FabricMgr>,
     acl_mgr: &'a RefCell<AclMgr>,
     failsafe: &'a RefCell<FailSafe>,
+    transport_mgr: &'a TransportMgr<'a>,
     mdns: &'a dyn Mdns,
 }
 
 impl<'a> NocCluster<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         dev_att: &'a dyn DevAttDataFetcher,
         fabric_mgr: &'a RefCell<FabricMgr>,
         acl_mgr: &'a RefCell<AclMgr>,
         failsafe: &'a RefCell<FailSafe>,
+        transport_mgr: &'a TransportMgr<'a>,
         mdns: &'a dyn Mdns,
         epoch: Epoch,
         rand: Rand,
@@ -242,6 +248,7 @@ impl<'a> NocCluster<'a> {
             fabric_mgr,
             acl_mgr,
             failsafe,
+            transport_mgr,
             mdns,
         }
     }
@@ -259,7 +266,7 @@ impl<'a> NocCluster<'a> {
                     Attributes::Fabrics(_) => {
                         writer.start_array(AttrDataWriter::TAG)?;
                         self.fabric_mgr.borrow().for_each(|entry, fab_idx| {
-                            if !attr.fab_filter || attr.fab_idx == fab_idx {
+                            if !attr.fab_filter || attr.fab_idx == fab_idx.get() {
                                 let root_ca_cert = entry.get_root_ca()?;
 
                                 entry
@@ -315,19 +322,13 @@ impl<'a> NocCluster<'a> {
         Ok(())
     }
 
-    fn add_acl(&self, fab_idx: u8, admin_subject: u64) -> Result<(), Error> {
-        let mut acl = AclEntry::new(fab_idx, Privilege::ADMIN, AuthMode::Case);
-        acl.add_subject(admin_subject)?;
-        self.acl_mgr.borrow_mut().add(acl)
-    }
-
     fn _handle_command_addnoc(
         &self,
         exchange: &Exchange,
         data: &TLVElement,
-    ) -> Result<u8, NocError> {
+    ) -> Result<NonZeroU8, NocError> {
         let noc_data = exchange
-            .with_session_mut(|sess| Ok(sess.take_noc_data()))?
+            .with_session(|sess| Ok(sess.take_noc_data()))?
             .ok_or(NocStatus::MissingCsr)?;
 
         if !self
@@ -339,16 +340,6 @@ impl<'a> NocCluster<'a> {
             error!("AddNOC not allowed by Fail Safe");
             Err(NocStatus::InsufficientPrivlege)?;
         }
-
-        // TODO
-        // // This command's processing may take longer, send a stand alone ACK to the peer to avoid any retranmissions
-        // let ack_send = secure_channel::common::send_mrp_standalone_ack(
-        //     trans.exch,
-        //     trans.session,
-        // );
-        // if ack_send.is_err() {
-        //     error!("Error sending Standalone ACK, falling back to piggybacked ACK");
-        // }
 
         let r = AddNocReq::from_tlv(data).map_err(|_| NocStatus::InvalidNOC)?;
 
@@ -382,15 +373,60 @@ impl<'a> NocCluster<'a> {
             "",
         )
         .map_err(|_| NocStatus::TableFull)?;
+
         let fab_idx = self
             .fabric_mgr
             .borrow_mut()
             .add(fabric, self.mdns)
             .map_err(|_| NocStatus::TableFull)?;
 
-        self.add_acl(fab_idx, r.case_admin_subject)?;
+        let succeeded = Cell::new(false);
+
+        let _fab_guard = scopeguard::guard(fab_idx, |fab_idx| {
+            if !succeeded.get() {
+                // Remove the fabric if we fail further down this function
+                warn!("Removing fabric {} due to failure", fab_idx.get());
+
+                self.fabric_mgr
+                    .borrow_mut()
+                    .remove(fab_idx, self.mdns)
+                    .unwrap();
+            }
+        });
+
+        let mut acl = AclEntry::new(fab_idx, Privilege::ADMIN, AuthMode::Case);
+        acl.add_subject(r.case_admin_subject)?;
+        let acl_entry_index = self.acl_mgr.borrow_mut().add(acl)?;
+
+        let _acl_guard = scopeguard::guard(fab_idx, |fab_idx| {
+            if !succeeded.get() {
+                // Remove the ACL entry if we fail further down this function
+                warn!(
+                    "Removing ACL entry {}/{} due to failure",
+                    acl_entry_index,
+                    fab_idx.get()
+                );
+
+                self.acl_mgr
+                    .borrow_mut()
+                    .delete(acl_entry_index, fab_idx)
+                    .unwrap();
+            }
+        });
 
         self.failsafe.borrow_mut().record_add_noc(fab_idx)?;
+
+        // Finally, upgrade our session with the new fabric index
+        exchange.with_session(|sess| {
+            if matches!(sess.get_session_mode(), SessionMode::Pase { .. }) {
+                sess.upgrade_fabric_idx(fab_idx)?;
+            }
+
+            Ok(())
+        })?;
+
+        // Leave the fabric and its ACLs in place now that we've updated everything
+        succeeded.set(true);
 
         Ok(fab_idx)
     }
@@ -420,21 +456,21 @@ impl<'a> NocCluster<'a> {
     ) -> Result<(), Error> {
         cmd_enter!("Update Fabric Label");
         let req = UpdateFabricLabelReq::from_tlv(data).map_err(Error::map_invalid_data_type)?;
-        let (result, fab_idx) = if let SessionMode::Case(c) =
+        let (result, fab_idx) = if let SessionMode::Case { fab_idx, .. } =
             exchange.with_session(|sess| Ok(sess.get_session_mode().clone()))?
         {
             if self
                 .fabric_mgr
                 .borrow_mut()
                 .set_label(
-                    c.fab_idx,
+                    fab_idx,
                     req.label.as_str().map_err(Error::map_invalid_data_type)?,
                 )
                 .is_err()
             {
-                (NocStatus::LabelConflict, c.fab_idx)
+                (NocStatus::LabelConflict, fab_idx.get())
             } else {
-                (NocStatus::Ok, c.fab_idx)
+                (NocStatus::Ok, fab_idx.get())
             }
         } else {
             // Update Fabric Label not allowed
@@ -461,10 +497,23 @@ impl<'a> NocCluster<'a> {
             .is_ok()
         {
             let _ = self.acl_mgr.borrow_mut().delete_for_fabric(req.fab_idx);
-            // TODO: transaction.terminate();
+            self.transport_mgr
+                .session_mgr
+                .borrow_mut()
+                .remove_for_fabric(req.fab_idx);
+            self.transport_mgr.session_removed.notify();
+
+            // Note that since we might have removed our own session, the exchange
+            // will terminate with a "NoSession" error, but that's OK and handled properly
+
             Ok(())
         } else {
-            Self::create_nocresponse(encoder, NocStatus::InvalidFabricIndex, req.fab_idx, "")
+            Self::create_nocresponse(
+                encoder,
+                NocStatus::InvalidFabricIndex,
+                req.fab_idx.get(),
+                "",
+            )
         }
     }
 
@@ -477,7 +526,7 @@ impl<'a> NocCluster<'a> {
         cmd_enter!("AddNOC");
 
         let (status, fab_idx) = match self._handle_command_addnoc(exchange, data) {
-            Ok(fab_idx) => (NocStatus::Ok, fab_idx),
+            Ok(fab_idx) => (NocStatus::Ok, fab_idx.get()),
             Err(NocError::Status(status)) => (status, 0),
             Err(NocError::Error(error)) => Err(error)?,
         };
@@ -596,7 +645,7 @@ impl<'a> NocCluster<'a> {
         let noc_data = NocData::new(noc_keypair);
         // Store this in the session data instead of cluster data, so it gets cleared
         // if the session goes away for some reason
-        exchange.with_session_mut(|sess| {
+        exchange.with_session(|sess| {
             sess.set_noc_data(noc_data);
             Ok(())
         })?;
@@ -605,7 +654,7 @@ impl<'a> NocCluster<'a> {
     }
 
     fn add_rca_to_session_noc_data(exchange: &Exchange, data: &TLVElement) -> Result<(), Error> {
-        exchange.with_session_mut(|sess| {
+        exchange.with_session(|sess| {
             let noc_data = sess.get_noc_data().ok_or(ErrorCode::NoSession)?;
 
             let req = CommonReq::from_tlv(data).map_err(Error::map_invalid_command)?;
@@ -630,11 +679,11 @@ impl<'a> NocCluster<'a> {
 
         // This may happen on CASE or PASE. For PASE, the existence of NOC Data is necessary
         match exchange.with_session(|sess| Ok(sess.get_session_mode().clone()))? {
-            SessionMode::Case(_) => {
+            SessionMode::Case { .. } => {
                 // TODO - Updating the Trusted RCA of an existing Fabric
                 Self::add_rca_to_session_noc_data(exchange, data)?;
             }
-            SessionMode::Pase => {
+            SessionMode::Pase { .. } => {
                 Self::add_rca_to_session_noc_data(exchange, data)?;
             }
             _ => (),

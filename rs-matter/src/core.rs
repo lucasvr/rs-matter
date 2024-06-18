@@ -15,34 +15,32 @@
  *    limitations under the License.
  */
 
-use core::{borrow::Borrow, cell::RefCell};
+use crate::acl::AclMgr;
+use crate::data_model::cluster_basic_information::BasicInfoConfig;
+use crate::data_model::sdm::dev_att::DevAttDataFetcher;
+use crate::data_model::sdm::failsafe::FailSafe;
+use crate::error::*;
+use crate::fabric::FabricMgr;
+use crate::mdns::{Mdns, MdnsService};
+use crate::pairing::{print_pairing_code_and_qr, DiscoveryCapabilities};
+use crate::secure_channel::pake::PaseMgr;
+use crate::secure_channel::spake2p::VerifierData;
+use crate::transport::core::{PacketBufferExternalAccess, TransportMgr};
+use crate::transport::network::{NetworkReceive, NetworkSend};
+use crate::utils::buf::BufferAccess;
+use crate::utils::epoch::Epoch;
+use crate::utils::notification::Notification;
+use crate::utils::rand::Rand;
 use alloc::boxed::Box;
-
-use embassy_sync::{blocking_mutex::raw::NoopRawMutex, mutex::Mutex};
-
-use crate::{
-    acl::AclMgr,
-    data_model::{
-        cluster_basic_information::BasicInfoConfig,
-        sdm::{dev_att::DevAttDataFetcher, failsafe::FailSafe},
-    },
-    error::*,
-    fabric::FabricMgr,
-    mdns::{Mdns, MdnsImpl, MdnsService},
-    pairing::{print_pairing_code_and_qr, DiscoveryCapabilities},
-    secure_channel::{pake::PaseMgr, spake2p::VerifierData},
-    transport::{
-        exchange::{ExchangeCtx, MAX_EXCHANGES},
-        packet::{MAX_RX_BUF_SIZE, MAX_TX_BUF_SIZE},
-        session::SessionMgr,
-    },
-    utils::{buf::BufferAccessImpl, epoch::Epoch, rand::Rand, select::Notification},
-};
+use core::borrow::Borrow;
+use core::cell::RefCell;
+use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 
 /* The Matter Port */
 pub const MATTER_PORT: u16 = 5540;
 
 /// Device Commissioning Data
+#[derive(Debug, Clone)]
 pub struct CommissioningData {
     /// The data like password or verifier that is required to authenticate
     pub verifier: VerifierData,
@@ -56,20 +54,13 @@ pub struct Matter<'a> {
     pub acl_mgr: RefCell<AclMgr>, // Public for tests
     pub(crate) pase_mgr: RefCell<PaseMgr>,
     pub(crate) failsafe: RefCell<FailSafe>,
-    persist_notification: Notification,
-    pub(crate) send_notification: Notification,
-    pub(crate) mdns: MdnsImpl<'a>,
-    pub(crate) tx_buf: BufferAccessImpl<MAX_RX_BUF_SIZE>,
-    pub(crate) rx_buf: BufferAccessImpl<MAX_TX_BUF_SIZE>,
+    pub transport_mgr: TransportMgr<'a>, // Public for tests
+    persist_notification: Notification<NoopRawMutex>,
     pub(crate) epoch: Epoch,
     pub(crate) rand: Rand,
     dev_det: &'a BasicInfoConfig<'a>,
     dev_att: &'a dyn DevAttDataFetcher,
     pub(crate) port: u16,
-    pub(crate) exchanges: RefCell<heapless::Vec<ExchangeCtx, MAX_EXCHANGES>>,
-    pub(crate) ephemeral: RefCell<Option<ExchangeCtx>>,
-    pub(crate) ephemeral_mutex: Mutex<NoopRawMutex, ()>,
-    pub session_mgr: RefCell<SessionMgr>, // Public for tests
     pub display_qrcode_callback: Option<Box<dyn Fn(&str)>>,
     pub clear_display_callback: Option<Box<dyn Fn()>>,
 }
@@ -93,8 +84,8 @@ impl<'a> Matter<'a> {
     ///
     /// # Parameters
     /// * dev_att: An object that implements the trait [DevAttDataFetcher]. Any Matter device
-    /// requires a set of device attestation certificates and keys. It is the responsibility of
-    /// this object to return the device attestation details when queried upon.
+    ///   requires a set of device attestation certificates and keys. It is the responsibility of
+    ///   this object to return the device attestation details when queried upon.
     #[inline(always)]
     pub const fn new(
         dev_det: &'a BasicInfoConfig<'a>,
@@ -109,20 +100,13 @@ impl<'a> Matter<'a> {
             acl_mgr: RefCell::new(AclMgr::new()),
             pase_mgr: RefCell::new(PaseMgr::new(epoch, rand)),
             failsafe: RefCell::new(FailSafe::new()),
+            transport_mgr: TransportMgr::new(mdns.new_impl(dev_det, port), epoch, rand),
             persist_notification: Notification::new(),
-            send_notification: Notification::new(),
-            mdns: mdns.new_impl(dev_det, port),
-            rx_buf: BufferAccessImpl::new(),
-            tx_buf: BufferAccessImpl::new(),
             epoch,
             rand,
             dev_det,
             dev_att,
             port,
-            exchanges: RefCell::new(heapless::Vec::new()),
-            ephemeral: RefCell::new(None),
-            ephemeral_mutex: Mutex::new(()),
-            session_mgr: RefCell::new(SessionMgr::new(epoch, rand)),
             display_qrcode_callback: None,
             clear_display_callback: None,
         }
@@ -135,6 +119,10 @@ impl<'a> Matter<'a> {
     ) {
         self.display_qrcode_callback = display_qrcode_callback;
         self.clear_display_callback = clear_display_callback;
+    }
+
+    pub fn initialize_transport_buffers(&self) -> Result<(), Error> {
+        self.transport_mgr.initialize_buffers()
     }
 
     pub fn dev_det(&self) -> &BasicInfoConfig<'_> {
@@ -150,7 +138,9 @@ impl<'a> Matter<'a> {
     }
 
     pub fn load_fabrics(&self, data: &[u8]) -> Result<(), Error> {
-        self.fabric_mgr.borrow_mut().load(data, &self.mdns)
+        self.fabric_mgr
+            .borrow_mut()
+            .load(data, &self.transport_mgr.mdns)
     }
 
     pub fn load_acls(&self, data: &[u8]) -> Result<(), Error> {
@@ -169,9 +159,10 @@ impl<'a> Matter<'a> {
         self.acl_mgr.borrow().is_changed() || self.fabric_mgr.borrow().is_changed()
     }
 
-    pub fn start_comissioning(
+    fn start_comissioning(
         &self,
         dev_comm: CommissioningData,
+        discovery_capabilities: DiscoveryCapabilities,
         buf: &mut [u8],
     ) -> Result<bool, Error> {
         if !self.pase_mgr.borrow().is_pase_session_enabled() && self.fabric_mgr.borrow().is_empty()
@@ -179,7 +170,7 @@ impl<'a> Matter<'a> {
             print_pairing_code_and_qr(
                 self.dev_det,
                 &dev_comm,
-                DiscoveryCapabilities::default(),
+                discovery_capabilities,
                 buf,
                 &self.display_qrcode_callback,
             )?;
@@ -187,7 +178,7 @@ impl<'a> Matter<'a> {
             self.pase_mgr.borrow_mut().enable_pase_session(
                 dev_comm.verifier,
                 dev_comm.discriminator,
-                &self.mdns,
+                &self.transport_mgr.mdns,
             )?;
 
             Ok(true)
@@ -196,12 +187,69 @@ impl<'a> Matter<'a> {
         }
     }
 
+    /// Resets the transport layer by clearing all sessions, exchanges, the RX buffer and the TX buffer
+    /// NOTE: User should be careful _not_ to call this method while the transport layer and/or the built-in mDNS is running.
+    pub fn reset_transport(&self) -> Result<(), Error> {
+        self.transport_mgr.reset()
+    }
+
+    pub async fn run<S, R>(
+        &self,
+        send: S,
+        recv: R,
+        dev_comm: Option<(CommissioningData, DiscoveryCapabilities)>,
+    ) -> Result<(), Error>
+    where
+        S: NetworkSend,
+        R: NetworkReceive,
+    {
+        if let Some((dev_comm, discovery_caps)) = dev_comm {
+            let buf_access = PacketBufferExternalAccess(&self.transport_mgr.rx);
+            let mut buf = buf_access.get().await.ok_or(ErrorCode::NoSpace)?;
+
+            self.start_comissioning(dev_comm, discovery_caps, &mut buf)?;
+        }
+
+        self.transport_mgr.run(send, recv).await
+    }
+
+    #[cfg(not(all(
+        feature = "std",
+        any(target_os = "macos", all(feature = "zeroconf", target_os = "linux"))
+    )))]
+    pub async fn run_builtin_mdns<S, R>(
+        &self,
+        send: S,
+        recv: R,
+        host: &crate::mdns::Host<'_>,
+        interface: Option<u32>,
+    ) -> Result<(), Error>
+    where
+        S: NetworkSend,
+        R: NetworkReceive,
+    {
+        self.transport_mgr
+            .run_builtin_mdns(send, recv, host, interface)
+            .await
+    }
+
+    /// Notify that the ACLs or Fabrics _might_ have changed
+    /// This method is supposed to be called after processing SC and IM messages that might affect the ACLs or Fabrics.
+    ///
+    /// The default IM and SC handlers (`DataModel` and `SecureChannel`) do call this method after processing the messages.
+    ///
+    /// TODO: Fix the method name as it is not clear enough. Potentially revamp the whole persistence notification logic
     pub fn notify_changed(&self) {
         if self.is_changed() {
-            self.persist_notification.signal(());
+            self.persist_notification.notify();
         }
     }
 
+    /// A hook for user persistence code to wait for potential changes in ACLs and/or Fabrics.
+    /// Once this future resolves, user code is supposed to inspect ACLs and Fabrics for changes, and
+    /// if there are changes, persist them.
+    ///
+    /// TODO: Fix the method name as it is not clear enough. Potentially revamp the whole persistence notification logic
     pub async fn wait_changed(&self) {
         self.persist_notification.wait().await
     }
@@ -231,6 +279,12 @@ impl<'a> Borrow<RefCell<FailSafe>> for Matter<'a> {
     }
 }
 
+impl<'a> Borrow<TransportMgr<'a>> for Matter<'a> {
+    fn borrow(&self) -> &TransportMgr<'a> {
+        &self.transport_mgr
+    }
+}
+
 impl<'a> Borrow<BasicInfoConfig<'a>> for Matter<'a> {
     fn borrow(&self) -> &BasicInfoConfig<'a> {
         self.dev_det
@@ -245,7 +299,7 @@ impl<'a> Borrow<dyn DevAttDataFetcher + 'a> for Matter<'a> {
 
 impl<'a> Borrow<dyn Mdns + 'a> for Matter<'a> {
     fn borrow(&self) -> &(dyn Mdns + 'a) {
-        &self.mdns
+        &self.transport_mgr.mdns
     }
 }
 
