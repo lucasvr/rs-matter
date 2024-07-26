@@ -76,7 +76,7 @@ pub type RootEndpointHandler<'a, NWCOMM, NWDIAG> = handler_chain_type!(
     NWDIAG,
     HandlerCompat<descriptor::DescriptorCluster<'a>>,
     HandlerCompat<cluster_basic_information::BasicInfoCluster>,
-    HandlerCompat<general_commissioning::GenCommCluster>,
+    HandlerCompat<general_commissioning::GenCommCluster<'a>>,
     HandlerCompat<admin_commissioning::AdminCommCluster>,
     HandlerCompat<noc::NocCluster>,
     HandlerCompat<access_control::AccessControlCluster>,
@@ -93,6 +93,7 @@ pub fn eth_handler(endpoint_id: u16, rand: Rand) -> EthRootEndpointHandler<'stat
         EthNwDiagCluster::new(Dataver::new_rand(rand)),
         true,
         rand,
+        &None,
     )
 }
 
@@ -107,7 +108,7 @@ pub fn handler<NWCOMM, NWDIAG>(
     nwdiag: NWDIAG,
     supports_concurrent_connection: bool,
     rand: Rand,
-    clear_display_callback: &'a Option<Box<dyn Fn()>>,
+    clear_display_callback: &'static Option<Box<dyn Fn()>>,
 ) -> RootEndpointHandler<'static, NWCOMM, NWDIAG> {
     wrap(
         endpoint_id,
@@ -127,7 +128,7 @@ fn wrap<NWCOMM, NWDIAG>(
     nwdiag: NWDIAG,
     supports_concurrent_connection: bool,
     rand: Rand,
-    clear_display_callback: &'a Option<Box<dyn Fn()>>,
+    clear_display_callback: &'static Option<Box<dyn Fn()>>,
 ) -> RootEndpointHandler<'static, NWCOMM, NWDIAG> {
     EmptyHandler
         .chain(

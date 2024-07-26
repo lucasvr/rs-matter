@@ -15,7 +15,8 @@
  *    limitations under the License.
  */
 
-use qrcodegen_no_heap::{QrCode, QrCodeEcc, Version};
+pub use qrcodegen_no_heap::QrCode;
+use qrcodegen_no_heap::{QrCodeEcc, Version};
 
 use crate::{
     error::ErrorCode,

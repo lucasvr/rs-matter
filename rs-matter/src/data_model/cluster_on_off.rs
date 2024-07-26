@@ -71,7 +71,7 @@ pub struct OnOffCluster<'a> {
     callback: Option<&'a dyn Fn(bool)>,
 }
 
-impl OnOffCluster {
+impl<'a> OnOffCluster<'a> {
     pub const fn new(data_ver: Dataver, callback: Option<&'a dyn Fn(bool)>) -> Self {
         Self {
             data_ver,

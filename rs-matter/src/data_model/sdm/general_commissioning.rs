@@ -130,7 +130,7 @@ impl Default for BasicCommissioningInfo {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GenCommCluster<'a> {
     data_ver: Dataver,
     basic_comm_info: BasicCommissioningInfo,
