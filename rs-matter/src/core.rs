@@ -16,6 +16,7 @@
  */
 
 use core::cell::RefCell;
+use alloc::boxed::Box;
 
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 
