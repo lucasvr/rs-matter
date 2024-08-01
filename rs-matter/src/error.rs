@@ -26,6 +26,7 @@ pub enum ErrorCode {
     CommandNotFound,
     Duplicate,
     EndpointNotFound,
+    IoError,
     InvalidAction,
     InvalidCommand,
     InvalidDataType,
