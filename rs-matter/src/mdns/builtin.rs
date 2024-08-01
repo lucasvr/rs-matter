@@ -132,7 +132,7 @@ impl<'a> MdnsImpl<'a> {
     {
         loop {
             let mut notification = pin!(self.notification.wait());
-            let mut timeout = pin!(Timer::after(Duration::from_secs(30)));
+            let mut timeout = pin!(Timer::after(Duration::from_secs(3)));
 
             select(&mut notification, &mut timeout).await;
 
