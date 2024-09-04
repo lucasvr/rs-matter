@@ -15,16 +15,17 @@
  *    limitations under the License.
  */
 
-use crate::data_model::objects::{Access, ClusterId, EndptId, Privilege};
-use crate::error::{Error, ErrorCode};
-use crate::fabric;
-use crate::interaction_model::messages::GenericPath;
-use crate::tlv::{self, FromTLV, Nullable, TLVElement, TLVList, TLVWriter, TagType, ToTLV};
-use crate::transport::session::{Session, SessionMode, MAX_CAT_IDS_PER_NOC};
-use crate::utils::writebuf::WriteBuf;
-use core::cell::RefCell;
-use core::fmt::Display;
-use core::num::NonZeroU8;
+use core::{cell::RefCell, fmt::Display, num::NonZeroU8};
+
+use crate::{
+    data_model::objects::{Access, ClusterId, EndptId, Privilege},
+    error::{Error, ErrorCode},
+    fabric,
+    interaction_model::messages::GenericPath,
+    tlv::{self, FromTLV, Nullable, TLVElement, TLVList, TLVWriter, TagType, ToTLV},
+    transport::session::{Session, SessionMode, MAX_CAT_IDS_PER_NOC},
+    utils::writebuf::WriteBuf,
+};
 use log::error;
 use num_derive::FromPrimitive;
 
@@ -367,10 +368,7 @@ impl AclEntry {
         }
 
         // true if both are true
-        //allow && self.fab_idx.get() == accessor.fab_idx
-
-        // TODO: investigate why we have a fabric index mismatch when commissioning from Apple HomeKit.
-        true
+        allow && self.fab_idx.get() == accessor.fab_idx
     }
 
     fn match_access_desc(&self, object: &AccessDesc) -> bool {
@@ -645,12 +643,15 @@ impl core::fmt::Display for AclMgr {
 #[cfg(test)]
 #[allow(clippy::bool_assert_comparison)]
 pub(crate) mod tests {
+    use core::{cell::RefCell, num::NonZeroU8};
+
+    use crate::{
+        acl::{gen_noc_cat, AccessorSubjects},
+        data_model::objects::{Access, Privilege},
+        interaction_model::messages::GenericPath,
+    };
+
     use super::{AccessReq, Accessor, AclEntry, AclMgr, AuthMode, Target};
-    use crate::acl::{gen_noc_cat, AccessorSubjects};
-    use crate::data_model::objects::{Access, Privilege};
-    use crate::interaction_model::messages::GenericPath;
-    use core::cell::RefCell;
-    use core::num::NonZeroU8;
 
     pub(crate) const FAB_1: NonZeroU8 = match NonZeroU8::new(1) {
         Some(f) => f,
