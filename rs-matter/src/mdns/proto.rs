@@ -1,4 +1,5 @@
 use core::fmt::Write;
+use core::net::{Ipv4Addr, Ipv6Addr};
 
 use bitflags::bitflags;
 
@@ -100,11 +101,11 @@ bitflags! {
 pub struct Host<'a> {
     pub id: u16,
     pub hostname: &'a str,
-    pub ip: [u8; 4],
-    pub ipv6: Option<[u8; 16]>,
+    pub ip: Ipv4Addr,
+    pub ipv6: Ipv6Addr,
 }
 
-impl<'a> Host<'a> {
+impl Host<'_> {
     /// Broadcast an mDNS packet with the host and its services
     ///
     /// Should be done pro-actively every time there is a change in the host
@@ -422,12 +423,18 @@ impl<'a> Host<'a> {
         R: RecordSectionBuilder<T>,
         T: Composer,
     {
-        answer.push((
-            Self::host_fqdn(self.hostname, false).unwrap(),
-            dns_class_with_flush(Class::IN),
-            ttl_sec,
-            A::from_octets(self.ip[0], self.ip[1], self.ip[2], self.ip[3]),
-        ))
+        if !self.ip.is_unspecified() {
+            let octets = self.ip.octets();
+
+            answer.push((
+                Self::host_fqdn(self.hostname, false).unwrap(),
+                dns_class_with_flush(Class::IN),
+                ttl_sec,
+                A::from_octets(octets[0], octets[1], octets[2], octets[3]),
+            ))?;
+        }
+
+        Ok(())
     }
 
     fn add_ipv6<R, T>(&self, answer: &mut R, ttl_sec: u32) -> Result<(), PushError>
@@ -435,16 +442,16 @@ impl<'a> Host<'a> {
         R: RecordSectionBuilder<T>,
         T: Composer,
     {
-        if let Some(ip) = &self.ipv6 {
+        if !self.ipv6.is_unspecified() {
             answer.push((
                 Self::host_fqdn(self.hostname, false).unwrap(),
                 dns_class_with_flush(Class::IN),
                 ttl_sec,
-                Aaaa::new((*ip).into()),
-            ))
-        } else {
-            Ok(())
+                Aaaa::new(self.ipv6.octets().into()),
+            ))?;
         }
+
+        Ok(())
     }
 
     fn host_fqdn(hostname: &str, suffix: bool) -> Result<impl ToName, FromStrError> {
@@ -457,7 +464,7 @@ impl<'a> Host<'a> {
     }
 }
 
-impl<'a> Service<'a> {
+impl Service<'_> {
     fn add_service<R, T>(
         &self,
         answer: &mut R,
@@ -586,7 +593,7 @@ impl<'a> Service<'a> {
             for (k, v) in self.txt_kvs {
                 octets.append_slice(&[(k.len() + v.len() + 1) as u8])?;
                 octets.append_slice(k.as_bytes())?;
-                octets.append_slice(&[b'='])?;
+                octets.append_slice(b"=")?;
                 octets.append_slice(v.as_bytes())?;
             }
 
@@ -661,9 +668,9 @@ impl<'a> Service<'a> {
 
 struct Buf<'a>(pub &'a mut [u8], pub usize);
 
-impl<'a> Composer for Buf<'a> {}
+impl Composer for Buf<'_> {}
 
-impl<'a> OctetsBuilder for Buf<'a> {
+impl OctetsBuilder for Buf<'_> {
     type AppendError = ShortBuf;
 
     fn append_slice(&mut self, slice: &[u8]) -> Result<(), Self::AppendError> {
@@ -679,19 +686,19 @@ impl<'a> OctetsBuilder for Buf<'a> {
     }
 }
 
-impl<'a> Truncate for Buf<'a> {
+impl Truncate for Buf<'_> {
     fn truncate(&mut self, len: usize) {
         self.1 = len;
     }
 }
 
-impl<'a> AsMut<[u8]> for Buf<'a> {
+impl AsMut<[u8]> for Buf<'_> {
     fn as_mut(&mut self) -> &mut [u8] {
         &mut self.0[..self.1]
     }
 }
 
-impl<'a> AsRef<[u8]> for Buf<'a> {
+impl AsRef<[u8]> for Buf<'_> {
     fn as_ref(&self) -> &[u8] {
         &self.0[..self.1]
     }
@@ -715,8 +722,8 @@ mod tests {
         host: Host {
             id: 0,
             hostname: "foo",
-            ip: [192, 168, 0, 1],
-            ipv6: None,
+            ip: Ipv4Addr::new(192, 168, 0, 1),
+            ipv6: Ipv6Addr::UNSPECIFIED,
         },
         services: &[],
 
@@ -760,8 +767,8 @@ mod tests {
         host: Host {
             id: 1,
             hostname: "foo",
-            ip: [192, 168, 0, 1],
-            ipv6: Some(Ipv6Addr::new(0xfb, 0, 0, 0, 0, 0, 0, 1).octets()),
+            ip: Ipv4Addr::new(192, 168, 0, 1),
+            ipv6: Ipv6Addr::new(0xfb, 0, 0, 0, 0, 0, 0, 1),
         },
         services: &[
             Service {
@@ -896,7 +903,7 @@ mod tests {
         tests: &'a [(&'a [Question<'a>], &'a [Answer<'a>], &'a [Answer<'a>])],
     }
 
-    impl<'a> TestRun<'a> {
+    impl TestRun<'_> {
         fn run(&self) {
             let mut buf1 = [0; 1500];
             let mut buf2 = [0; 1500];
@@ -930,7 +937,7 @@ mod tests {
         qtype: Rtype,
     }
 
-    impl<'a> Question<'a> {
+    impl Question<'_> {
         fn prep<'b>(buf: &'b mut [u8], id: u16, questions: &[Question]) -> &'b [u8] {
             let message = MessageBuilder::from_target(Buf(buf, 0)).unwrap();
 
@@ -974,7 +981,7 @@ mod tests {
         details: AnswerDetails<'a>,
     }
 
-    impl<'a> Answer<'a> {
+    impl Answer<'_> {
         fn validate(
             data: &[u8],
             expected_id: u16,
@@ -1064,7 +1071,7 @@ mod tests {
                             assert_eq!(t, str);
                         }
 
-                        while let Some(t) = txt.next() {
+                        for t in txt {
                             if !t.is_empty() {
                                 panic!("Unexpected TXT string {:?} for {}", t, expected.owner);
                             }

@@ -15,28 +15,9 @@
  *    limitations under the License.
  */
 
-#![cfg(feature = "std")]
-
-use embassy_sync::blocking_mutex::raw::RawMutex;
-
-/// An `embassy-sync` `RawMutex` implementation using `std::sync::Mutex`.
-/// TODO: Upstream into `embassy-sync` itself.
-#[derive(Default)]
-pub struct StdRawMutex(std::sync::Mutex<()>);
-
-impl StdRawMutex {
-    pub const fn new() -> Self {
-        Self(std::sync::Mutex::new(()))
-    }
-}
-
-unsafe impl RawMutex for StdRawMutex {
-    #[allow(clippy::declare_interior_mutable_const)]
-    const INIT: Self = StdRawMutex(std::sync::Mutex::new(()));
-
-    fn lock<R>(&self, f: impl FnOnce() -> R) -> R {
-        let _guard = self.0.lock().unwrap();
-
-        f()
-    }
-}
+mod acl_and_dataver;
+mod attribute_lists;
+mod attributes;
+mod commands;
+mod long_reads;
+mod timed_requests;

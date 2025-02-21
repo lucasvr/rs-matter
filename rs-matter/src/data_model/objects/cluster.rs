@@ -31,7 +31,7 @@ use crate::{
         },
     },
     // TODO: This layer shouldn't really depend on the TLV layer, should create an abstraction layer
-    tlv::{Nullable, TLVWriter, TagType},
+    tlv::{Nullable, TLVTag, TLVWrite},
 };
 use core::fmt::{self, Debug};
 
@@ -80,7 +80,7 @@ pub struct AttrDetails<'a> {
     pub wildcard: bool,
 }
 
-impl<'a> AttrDetails<'a> {
+impl AttrDetails<'_> {
     pub fn is_system(&self) -> bool {
         Attribute::is_system_attr(self.attr_id)
     }
@@ -90,7 +90,7 @@ impl<'a> AttrDetails<'a> {
             endpoint: Some(self.endpoint_id),
             cluster: Some(self.cluster_id),
             attr: Some(self.attr_id),
-            list_index: self.list_index,
+            list_index: self.list_index.clone(),
             ..Default::default()
         }
     }
@@ -136,7 +136,7 @@ pub struct CmdDetails<'a> {
     pub wildcard: bool,
 }
 
-impl<'a> CmdDetails<'a> {
+impl CmdDetails<'_> {
     pub fn path(&self) -> CmdPath {
         CmdPath::new(
             Some(self.endpoint_id),
@@ -193,6 +193,7 @@ pub struct Cluster<'a> {
 }
 
 impl<'a> Cluster<'a> {
+    /// Create a new cluster with the provided parameters.
     pub const fn new(
         id: ClusterId,
         feature_map: u32,
@@ -207,60 +208,10 @@ impl<'a> Cluster<'a> {
         }
     }
 
-    pub fn match_attributes(
-        &self,
-        attr: Option<AttrId>,
-    ) -> impl Iterator<Item = &'_ Attribute> + '_ {
-        self.attributes
-            .iter()
-            .filter(move |attribute| attr.map(|attr| attr == attribute.id).unwrap_or(true))
-    }
-
-    pub fn match_commands(&self, cmd: Option<CmdId>) -> impl Iterator<Item = CmdId> + '_ {
-        self.commands
-            .iter()
-            .filter(move |id| cmd.map(|cmd| **id == cmd).unwrap_or(true))
-            .copied()
-    }
-
-    pub fn check_attribute(
-        &self,
-        accessor: &Accessor,
-        ep: EndptId,
-        attr: AttrId,
-        write: bool,
-    ) -> Result<(), IMStatusCode> {
-        let attribute = self
-            .attributes
-            .iter()
-            .find(|attribute| attribute.id == attr)
-            .ok_or(IMStatusCode::UnsupportedAttribute)?;
-
-        Self::check_attr_access(
-            accessor,
-            GenericPath::new(Some(ep), Some(self.id), Some(attr as _)),
-            write,
-            attribute.access,
-        )
-    }
-
-    pub fn check_command(
-        &self,
-        accessor: &Accessor,
-        ep: EndptId,
-        cmd: CmdId,
-    ) -> Result<(), IMStatusCode> {
-        self.commands
-            .iter()
-            .find(|id| **id == cmd)
-            .ok_or(IMStatusCode::UnsupportedCommand)?;
-
-        Self::check_cmd_access(
-            accessor,
-            GenericPath::new(Some(ep), Some(self.id), Some(cmd)),
-        )
-    }
-
+    /// Check if the accessor has the required permissions to access the attribute
+    /// designated by the provided path.
+    ///
+    /// if `write` is true, the operation is a write operation, otherwise it is a read operation.
     pub(crate) fn check_attr_access(
         accessor: &Accessor,
         path: GenericPath,
@@ -289,6 +240,8 @@ impl<'a> Cluster<'a> {
         }
     }
 
+    /// Check if the accessor has the required permissions to access the command
+    /// designated by the provided path.
     pub(crate) fn check_cmd_access(
         accessor: &Accessor,
         path: GenericPath,
@@ -311,7 +264,7 @@ impl<'a> Cluster<'a> {
     pub fn read(&self, attr: AttrId, mut writer: AttrDataWriter) -> Result<(), Error> {
         match attr.try_into()? {
             GlobalElements::AttributeList => {
-                self.encode_attribute_ids(AttrDataWriter::TAG, &mut writer)?;
+                self.encode_attribute_ids(&AttrDataWriter::TAG, &mut *writer)?;
                 writer.complete()
             }
             GlobalElements::FeatureMap => writer.set(self.feature_map),
@@ -322,17 +275,17 @@ impl<'a> Cluster<'a> {
         }
     }
 
-    fn encode_attribute_ids(&self, tag: TagType, tw: &mut TLVWriter) -> Result<(), Error> {
+    fn encode_attribute_ids<W: TLVWrite>(&self, tag: &TLVTag, mut tw: W) -> Result<(), Error> {
         tw.start_array(tag)?;
         for a in self.attributes {
-            tw.u16(TagType::Anonymous, a.id)?;
+            tw.u16(&TLVTag::Anonymous, a.id)?;
         }
 
         tw.end_container()
     }
 }
 
-impl<'a> core::fmt::Display for Cluster<'a> {
+impl core::fmt::Display for Cluster<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "id:{}, ", self.id)?;
         write!(f, "attrs[")?;

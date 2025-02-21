@@ -41,19 +41,33 @@ const WIFI_NW_CLUSTERS: [Cluster<'static>; 10] = [
     group_key_management::CLUSTER,
 ];
 
-/// The type of operational network (Ethernet, Wifi or (future) Thread)
+const THREAD_NW_CLUSTERS: [Cluster<'static>; 10] = [
+    descriptor::CLUSTER,
+    cluster_basic_information::CLUSTER,
+    general_commissioning::CLUSTER,
+    nw_commissioning::THR_CLUSTER,
+    admin_commissioning::CLUSTER,
+    noc::CLUSTER,
+    access_control::CLUSTER,
+    general_diagnostics::CLUSTER,
+    wifi_nw_diagnostics::CLUSTER,
+    group_key_management::CLUSTER,
+];
+
+/// The type of operational network (Ethernet, Wifi or Thread)
 /// for which root endpoint meta-data is being requested
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum OperNwType {
     Ethernet,
     Wifi,
+    Thread,
 }
 
 /// A utility function to create a root (Endpoint 0) object using the requested operational network type.
 pub const fn endpoint(id: EndptId, op_nw_type: OperNwType) -> Endpoint<'static> {
     Endpoint {
         id,
-        device_type: super::device_types::DEV_TYPE_ROOT_NODE,
+        device_types: &[super::device_types::DEV_TYPE_ROOT_NODE],
         clusters: clusters(op_nw_type),
     }
 }
@@ -63,6 +77,7 @@ pub const fn clusters(op_nw_type: OperNwType) -> &'static [Cluster<'static>] {
     match op_nw_type {
         OperNwType::Ethernet => &ETH_NW_CLUSTERS,
         OperNwType::Wifi => &WIFI_NW_CLUSTERS,
+        OperNwType::Thread => &THREAD_NW_CLUSTERS,
     }
 }
 

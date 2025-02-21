@@ -23,7 +23,8 @@ use embassy_futures::select::{select, Either};
 use embassy_sync::blocking_mutex::raw::RawMutex;
 use embassy_time::{Duration, Timer};
 
-use super::signal::Signal;
+use crate::utils::init::{init, Init, UnsafeCellInit};
+use crate::utils::sync::Signal;
 
 /// A trait for getting access to a `&mut T` buffer, potentially awaiting until a buffer becomes available.
 pub trait BufferAccess<T>
@@ -48,7 +49,10 @@ where
     B: BufferAccess<T>,
     T: ?Sized,
 {
-    type Buffer<'a> = B::Buffer<'a> where Self: 'a;
+    type Buffer<'a>
+        = B::Buffer<'a>
+    where
+        Self: 'a;
 
     async fn get(&self) -> Option<Self::Buffer<'_>> {
         (*self).get().await
@@ -59,7 +63,7 @@ where
 /// Accessing a buffer would fail when all buffers are still used elsewhere after a wait timeout expires.
 pub struct PooledBuffers<const N: usize, M, T> {
     available: Signal<M, [bool; N]>,
-    pool: UnsafeCell<heapless::Vec<T, N>>,
+    pool: UnsafeCell<crate::utils::storage::Vec<T, N>>,
     wait_timeout_ms: u32,
 }
 
@@ -67,13 +71,29 @@ impl<const N: usize, M, T> PooledBuffers<N, M, T>
 where
     M: RawMutex,
 {
+    /// Create a new instance of `PooledBuffers`.
+    ///
+    /// `wait_timneout_ms` is the maximum time to wait for a buffer to become available
+    /// before returning `None`.
     #[inline(always)]
     pub const fn new(wait_timeout_ms: u32) -> Self {
         Self {
             available: Signal::new([true; N]),
-            pool: UnsafeCell::new(heapless::Vec::new()),
+            pool: UnsafeCell::new(crate::utils::storage::Vec::new()),
             wait_timeout_ms,
         }
+    }
+
+    /// Create an in-place initializer for `PooledBuffers`.
+    ///
+    /// `wait_timneout_ms` is the maximum time to wait for a buffer to become available
+    /// before returning `None`.
+    pub fn init(wait_timeout_ms: u32) -> impl Init<Self> {
+        init!(Self {
+            available: Signal::new([true; N]),
+            pool <- UnsafeCell::init(crate::utils::storage::Vec::init()),
+            wait_timeout_ms,
+        })
     }
 }
 
@@ -82,7 +102,10 @@ where
     M: RawMutex,
     T: Default + Clone,
 {
-    type Buffer<'b> = PooledBuffer<'b, N, M, T> where Self: 'b;
+    type Buffer<'b>
+        = PooledBuffer<'b, N, M, T>
+    where
+        Self: 'b;
 
     async fn get(&self) -> Option<Self::Buffer<'_>> {
         if self.wait_timeout_ms > 0 {
@@ -148,7 +171,7 @@ where
     access: &'a PooledBuffers<N, M, T>,
 }
 
-impl<'a, const N: usize, M, T> Drop for PooledBuffer<'a, N, M, T>
+impl<const N: usize, M, T> Drop for PooledBuffer<'_, N, M, T>
 where
     M: RawMutex,
 {
@@ -160,7 +183,7 @@ where
     }
 }
 
-impl<'a, const N: usize, M, T> Deref for PooledBuffer<'a, N, M, T>
+impl<const N: usize, M, T> Deref for PooledBuffer<'_, N, M, T>
 where
     M: RawMutex,
 {
@@ -171,7 +194,7 @@ where
     }
 }
 
-impl<'a, const N: usize, M, T> DerefMut for PooledBuffer<'a, N, M, T>
+impl<const N: usize, M, T> DerefMut for PooledBuffer<'_, N, M, T>
 where
     M: RawMutex,
 {

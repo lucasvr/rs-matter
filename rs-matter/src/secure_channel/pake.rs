@@ -17,31 +17,62 @@
 
 use core::{fmt::Write, time::Duration};
 
-use super::{
-    common::SCStatusCodes,
-    spake2p::{Spake2P, VerifierData, MAX_SALT_SIZE_BYTES},
-};
-use crate::{
-    crypto,
-    error::{Error, ErrorCode},
-    mdns::{Mdns, ServiceMode},
-    secure_channel::common::{complete_with_status, OpCode},
-    tlv::{self, get_root_node_struct, FromTLV, OctetStr, TLVWriter, TagType, ToTLV},
-    transport::{
-        exchange::{Exchange, ExchangeId},
-        session::{ReservedSession, SessionMode},
-    },
-    utils::{epoch::Epoch, rand::Rand},
-};
 use log::{error, info};
+
+use crate::crypto;
+use crate::error::{Error, ErrorCode};
+use crate::mdns::{Mdns, ServiceMode};
+use crate::secure_channel::common::{complete_with_status, OpCode};
+use crate::tlv::{get_root_node_struct, FromTLV, OctetStr, TLVElement, TagType, ToTLV};
+use crate::transport::exchange::{Exchange, ExchangeId};
+use crate::transport::session::{ReservedSession, SessionMode};
+use crate::utils::epoch::Epoch;
+use crate::utils::init::{init, try_init, Init};
+use crate::utils::maybe::Maybe;
+use crate::utils::rand::Rand;
+
+use super::common::SCStatusCodes;
+use super::spake2p::{Spake2P, VerifierData, MAX_SALT_SIZE_BYTES};
 
 struct PaseSession {
     mdns_service_name: heapless::String<16>,
     verifier: VerifierData,
 }
 
+impl PaseSession {
+    fn init_with_pw(password: u32, rand: Rand) -> impl Init<Self> {
+        init!(Self {
+            mdns_service_name: heapless::String::new(),
+            verifier <- VerifierData::init_with_pw(password, rand),
+        })
+    }
+
+    fn init<'a>(verifier: &'a [u8], salt: &'a [u8], count: u32) -> impl Init<Self, Error> + 'a {
+        try_init!(Self {
+            mdns_service_name: heapless::String::new(),
+            verifier <- VerifierData::init(verifier, salt, count),
+        }? Error)
+    }
+
+    fn add_mdns(&mut self, discriminator: u16, rand: Rand, mdns: &dyn Mdns) -> Result<(), Error> {
+        let mut buf = [0; 8];
+        (rand)(&mut buf);
+        let num = u64::from_be_bytes(buf);
+
+        self.mdns_service_name.clear();
+        write!(&mut self.mdns_service_name, "{:016X}", num).unwrap();
+
+        mdns.add(
+            &self.mdns_service_name,
+            ServiceMode::Commissionable(discriminator),
+        )?;
+
+        Ok(())
+    }
+}
+
 pub struct PaseMgr {
-    session: Option<PaseSession>,
+    session: Maybe<PaseSession>,
     timeout: Option<Timeout>,
     epoch: Epoch,
     rand: Rand,
@@ -51,41 +82,68 @@ impl PaseMgr {
     #[inline(always)]
     pub const fn new(epoch: Epoch, rand: Rand) -> Self {
         Self {
-            session: None,
+            session: Maybe::none(),
             timeout: None,
             epoch,
             rand,
         }
     }
 
+    pub fn init(epoch: Epoch, rand: Rand) -> impl Init<Self> {
+        init!(Self {
+            session <- Maybe::init_none(),
+            timeout: None,
+            epoch,
+            rand,
+        })
+    }
+
     pub fn is_pase_session_enabled(&self) -> bool {
         self.session.is_some()
     }
 
-    pub fn enable_pase_session(
+    pub fn enable_basic_pase_session(
         &mut self,
-        verifier: VerifierData,
+        password: u32,
         discriminator: u16,
+        _timeout_secs: u16,
         mdns: &dyn Mdns,
     ) -> Result<(), Error> {
-        let mut buf = [0; 8];
-        (self.rand)(&mut buf);
-        let num = u64::from_be_bytes(buf);
+        if self.session.is_some() {
+            Err(ErrorCode::Invalid)?;
+        }
 
-        let mut mdns_service_name = heapless::String::<16>::new();
-        write!(&mut mdns_service_name, "{:016X}", num).unwrap();
+        self.session
+            .reinit(Maybe::init_some(PaseSession::init_with_pw(
+                password, self.rand,
+            )));
 
-        mdns.add(
-            &mdns_service_name,
-            ServiceMode::Commissionable(discriminator),
-        )?;
+        // Can't fail as we just initialized the session
+        let session = self.session.as_mut().unwrap();
 
-        self.session = Some(PaseSession {
-            mdns_service_name,
-            verifier,
-        });
+        session.add_mdns(discriminator, self.rand, mdns)
+    }
 
-        Ok(())
+    pub fn enable_pase_session(
+        &mut self,
+        verifier: &[u8],
+        salt: &[u8],
+        count: u32,
+        discriminator: u16,
+        _timeout_secs: u16,
+        mdns: &dyn Mdns,
+    ) -> Result<(), Error> {
+        if self.session.is_some() {
+            Err(ErrorCode::Invalid)?;
+        }
+
+        self.session
+            .try_reinit(Maybe::init_some(PaseSession::init(verifier, salt, count)))?;
+
+        // Can't fail as we just initialized the session
+        let session = self.session.as_mut().unwrap();
+
+        session.add_mdns(discriminator, self.rand, mdns)
     }
 
     pub fn disable_pase_session(&mut self, mdns: &dyn Mdns) -> Result<bool, Error> {
@@ -97,7 +155,7 @@ impl PaseMgr {
             false
         };
 
-        self.session = None;
+        self.session.clear();
 
         Ok(disabled)
     }
@@ -109,8 +167,7 @@ impl PaseMgr {
 // handles Spake2+ specific stuff.
 
 const PASE_DISCARD_TIMEOUT_SECS: Duration = Duration::from_secs(60);
-
-const SPAKE2_SESSION_KEYS_INFO: [u8; 11] = *b"SessionKeys";
+const SPAKE2_SESSION_KEYS_INFO: &[u8] = b"SessionKeys";
 
 struct Timeout {
     start_time: Duration,
@@ -168,7 +225,9 @@ impl Pake {
         self.handle_pasepake3(exchange, session, spake2p).await?;
 
         exchange.acknowledge().await?;
-        exchange.matter().notify_changed();
+        exchange.matter().notify_fabrics_maybe_changed();
+
+        self.clear_timeout(exchange);
 
         Ok(())
     }
@@ -189,7 +248,7 @@ impl Pake {
             // Get the keys
             let ke = ke.ok_or(ErrorCode::Invalid)?;
             let mut session_keys: [u8; 48] = [0; 48];
-            crypto::hkdf_sha256(&[], ke, &SPAKE2_SESSION_KEYS_INFO, &mut session_keys)
+            crypto::hkdf_sha256(&[], ke, SPAKE2_SESSION_KEYS_INFO, &mut session_keys)
                 .map_err(|_x| ErrorCode::NoSpace)?;
 
             // Create a session
@@ -265,10 +324,10 @@ impl Pake {
         exchange
             .send_with(|_, wb| {
                 let resp = Pake1Resp {
-                    pb: OctetStr(&pB),
-                    cb: OctetStr(&cB),
+                    pb: OctetStr::new(&pB),
+                    cb: OctetStr::new(&cB),
                 };
-                resp.to_tlv(&mut TLVWriter::new(wb), TagType::Anonymous)?;
+                resp.to_tlv(&TagType::Anonymous, wb)?;
 
                 Ok(Some(OpCode::PASEPake2.into()))
             })
@@ -291,8 +350,7 @@ impl Pake {
             let pase = exchange.matter().pase_mgr.borrow();
             let session = pase.session.as_ref().ok_or(ErrorCode::NoSession)?;
 
-            let root = tlv::get_root_node(rx.payload())?;
-            let a = PBKDFParamReq::from_tlv(&root)?;
+            let a = PBKDFParamReq::from_tlv(&TLVElement::new(rx.payload()))?;
             if a.passcode_id != 0 {
                 error!("Can't yet handle passcode_id != 0");
                 Err(ErrorCode::Invalid)?;
@@ -317,14 +375,14 @@ impl Pake {
             // Generate response
             let mut resp = PBKDFParamResp {
                 init_random: OctetStr::new(initiator_random),
-                our_random: OctetStr(&our_random),
+                our_random: OctetStr::new(&our_random),
                 local_sessid,
                 params: None,
             };
             if !a.has_params {
                 let params_resp = PBKDFParamRespParams {
                     count: session.verifier.count,
-                    salt: OctetStr(&salt),
+                    salt: OctetStr::new(&salt),
                 };
                 resp.params = Some(params_resp);
             }
@@ -338,7 +396,7 @@ impl Pake {
         let mut context_set = false;
         exchange
             .send_with(|_, wb| {
-                resp.to_tlv(&mut TLVWriter::new(wb), TagType::Anonymous)?;
+                resp.to_tlv(&TagType::Anonymous, &mut *wb)?;
 
                 if !context_set {
                     spake2p.update_context(wb.as_slice())?;
@@ -348,6 +406,12 @@ impl Pake {
                 Ok(Some(OpCode::PBKDFParamResponse.into()))
             })
             .await
+    }
+
+    fn clear_timeout(&mut self, exchange: &Exchange) {
+        let mut pase = exchange.matter().pase_mgr.borrow_mut();
+
+        pase.timeout = None;
     }
 
     async fn update_timeout(
@@ -442,7 +506,7 @@ struct PBKDFParamResp<'a> {
 #[allow(non_snake_case)]
 fn extract_pasepake_1_or_3_params(buf: &[u8]) -> Result<&[u8], Error> {
     let root = get_root_node_struct(buf)?;
-    let pA = root.find_tag(1)?.slice()?;
+    let pA = root.structure()?.ctx(1)?.str()?;
     Ok(pA)
 }
 

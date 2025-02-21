@@ -15,45 +15,43 @@
  *    limitations under the License.
  */
 
-use core::cell::RefCell;
 use alloc::boxed::Box;
-
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 
-use crate::{
-    acl::AclMgr,
-    data_model::{
-        cluster_basic_information::BasicInfoConfig,
-        sdm::{dev_att::DevAttDataFetcher, failsafe::FailSafe},
-    },
-    error::*,
-    fabric::FabricMgr,
-    mdns::MdnsService,
-    pairing::{print_pairing_code_and_qr, DiscoveryCapabilities},
-    secure_channel::{pake::PaseMgr, spake2p::VerifierData},
-    transport::{
-        core::{PacketBufferExternalAccess, TransportMgr},
-        network::{NetworkReceive, NetworkSend},
-    },
-    utils::{buf::BufferAccess, epoch::Epoch, notification::Notification, rand::Rand},
+use crate::data_model::{
+    cluster_basic_information::BasicInfoConfig,
+    sdm::{dev_att::DevAttDataFetcher, failsafe::FailSafe},
 };
+use crate::error::*;
+use crate::fabric::FabricMgr;
+use crate::mdns::MdnsService;
+use crate::pairing::{print_pairing_code_and_qr, DiscoveryCapabilities};
+use crate::secure_channel::pake::PaseMgr;
+use crate::transport::core::{PacketBufferExternalAccess, TransportMgr};
+use crate::transport::network::{NetworkReceive, NetworkSend};
+use crate::utils::cell::RefCell;
+use crate::utils::epoch::Epoch;
+use crate::utils::init::{init, Init};
+use crate::utils::rand::Rand;
+use crate::utils::storage::pooled::BufferAccess;
+use crate::utils::sync::Notification;
 
 /* The Matter Port */
 pub const MATTER_PORT: u16 = 5540;
 
-/// Device Commissioning Data
-#[derive(Debug, Clone)]
-pub struct CommissioningData {
-    /// The data like password or verifier that is required to authenticate
-    pub verifier: VerifierData,
+/// Device basic commissioning data
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub struct BasicCommData {
+    /// The password which is necessary to authenticate the device in either
+    /// initial commissioning, or when the basic commissioning window is opened
+    pub password: u32,
     /// The 12-bit discriminator used to differentiate between multiple devices
     pub discriminator: u16,
 }
 
 /// The primary Matter Object
 pub struct Matter<'a> {
-    pub(crate) fabric_mgr: RefCell<FabricMgr>,
-    pub acl_mgr: RefCell<AclMgr>, // Public for tests
+    pub fabric_mgr: RefCell<FabricMgr>, // Public for tests
     pub(crate) pase_mgr: RefCell<PaseMgr>,
     pub(crate) failsafe: RefCell<FailSafe>,
     pub transport_mgr: TransportMgr<'a>, // Public for tests
@@ -61,6 +59,7 @@ pub struct Matter<'a> {
     epoch: Epoch,
     rand: Rand,
     dev_det: &'a BasicInfoConfig<'a>,
+    dev_comm: BasicCommData,
     dev_att: &'a dyn DevAttDataFetcher,
     port: u16,
     pub display_qrcode_callback: Option<Box<dyn Fn(&str)>>,
@@ -68,10 +67,23 @@ pub struct Matter<'a> {
 }
 
 impl<'a> Matter<'a> {
+    /// Create a new Matter object when support for the Rust Standard Library is enabled.
+    ///
+    /// # Parameters
+    /// * dev_det: An object of type [BasicInfoConfig].
+    /// * dev_comm: An object of type [BasicCommData]. This object contains the basic commissioning
+    ///   data required for the device.
+    /// * dev_att: An object that implements the trait [DevAttDataFetcher]. Any Matter device
+    ///   requires a set of device attestation certificates and keys. It is the responsibility of
+    ///   this object to return the device attestation details when queried upon.
+    /// * mdns: An object of type [MdnsService]. This object is responsible for handling mDNS
+    ///   responses and queries related to the operation of the Matter stack.
+    /// * port: The port number on which the Matter stack will listen for incoming connections.
     #[cfg(feature = "std")]
     #[inline(always)]
     pub const fn new_default(
         dev_det: &'a BasicInfoConfig<'a>,
+        dev_comm: BasicCommData,
         dev_att: &'a dyn DevAttDataFetcher,
         mdns: MdnsService<'a>,
         port: u16,
@@ -79,18 +91,28 @@ impl<'a> Matter<'a> {
         use crate::utils::epoch::sys_epoch;
         use crate::utils::rand::sys_rand;
 
-        Self::new(dev_det, dev_att, mdns, sys_epoch, sys_rand, port)
+        Self::new(dev_det, dev_comm, dev_att, mdns, sys_epoch, sys_rand, port)
     }
 
-    /// Creates a new Matter object
+    /// Create a new Matter object
     ///
     /// # Parameters
+    /// * dev_det: An object of type [BasicInfoConfig].
+    /// * dev_comm: An object of type [BasicCommData]. This object contains the basic commissioning
+    ///   data required for the device.
     /// * dev_att: An object that implements the trait [DevAttDataFetcher]. Any Matter device
     ///   requires a set of device attestation certificates and keys. It is the responsibility of
     ///   this object to return the device attestation details when queried upon.
+    /// * mdns: An object of type [MdnsService]. This object is responsible for handling mDNS
+    ///   responses and queries related to the operation of the Matter stack.
+    /// * epoch: A function of type [Epoch]. This function is responsible for providing the current
+    ///   "unix" time in milliseconds
+    /// * rand: A function of type [Rand]. This function is responsible for generating random data.
+    /// * port: The port number on which the Matter stack will listen for incoming connections.
     #[inline(always)]
     pub const fn new(
         dev_det: &'a BasicInfoConfig<'a>,
+        dev_comm: BasicCommData,
         dev_att: &'a dyn DevAttDataFetcher,
         mdns: MdnsService<'a>,
         epoch: Epoch,
@@ -99,19 +121,89 @@ impl<'a> Matter<'a> {
     ) -> Self {
         Self {
             fabric_mgr: RefCell::new(FabricMgr::new()),
-            acl_mgr: RefCell::new(AclMgr::new()),
             pase_mgr: RefCell::new(PaseMgr::new(epoch, rand)),
-            failsafe: RefCell::new(FailSafe::new()),
-            transport_mgr: TransportMgr::new(mdns.new_impl(dev_det, port), epoch, rand),
+            failsafe: RefCell::new(FailSafe::new(epoch, rand)),
+            transport_mgr: TransportMgr::new(mdns, dev_det, port, epoch, rand),
             persist_notification: Notification::new(),
             epoch,
             rand,
             dev_det,
+            dev_comm,
             dev_att,
             port,
             display_qrcode_callback: None,
             clear_display_callback: None,
         }
+    }
+
+    /// Create an in-place initializer for a Matter object
+    /// when support for the Rust Standard Library is enabled.
+    ///
+    /// # Parameters
+    /// * dev_det: An object of type [BasicInfoConfig].
+    /// * dev_comm: An object of type [BasicCommData]. This object contains the basic commissioning
+    ///   data required for the device.
+    /// * dev_att: An object that implements the trait [DevAttDataFetcher]. Any Matter device
+    ///   requires a set of device attestation certificates and keys. It is the responsibility of
+    ///   this object to return the device attestation details when queried upon.
+    /// * mdns: An object of type [MdnsService]. This object is responsible for handling mDNS
+    ///   responses and queries related to the operation of the Matter stack.
+    /// * port: The port number on which the Matter stack will listen for incoming connections.
+    #[cfg(feature = "std")]
+    pub fn init_default(
+        dev_det: &'a BasicInfoConfig<'a>,
+        dev_comm: BasicCommData,
+        dev_att: &'a dyn DevAttDataFetcher,
+        mdns: MdnsService<'a>,
+        port: u16,
+    ) -> impl Init<Self> {
+        use crate::utils::epoch::sys_epoch;
+        use crate::utils::rand::sys_rand;
+
+        Self::init(dev_det, dev_comm, dev_att, mdns, sys_epoch, sys_rand, port)
+    }
+
+    /// Create an in-place initializer for a Matter object
+    ///
+    /// # Parameters
+    /// * dev_det: An object of type [BasicInfoConfig].
+    /// * dev_comm: An object of type [BasicCommData]. This object contains the basic commissioning
+    ///   data required for the device.
+    /// * dev_att: An object that implements the trait [DevAttDataFetcher]. Any Matter device
+    ///   requires a set of device attestation certificates and keys. It is the responsibility of
+    ///   this object to return the device attestation details when queried upon.
+    /// * mdns: An object of type [MdnsService]. This object is responsible for handling mDNS
+    ///   responses and queries related to the operation of the Matter stack.
+    /// * epoch: A function of type [Epoch]. This function is responsible for providing the current
+    ///   "unix" time in milliseconds
+    /// * rand: A function of type [Rand]. This function is responsible for generating random data.
+    /// * port: The port number on which the Matter stack will listen for incoming connections.
+    pub fn init(
+        dev_det: &'a BasicInfoConfig<'a>,
+        dev_comm: BasicCommData,
+        dev_att: &'a dyn DevAttDataFetcher,
+        mdns: MdnsService<'a>,
+        epoch: Epoch,
+        rand: Rand,
+        port: u16,
+    ) -> impl Init<Self> {
+        init!(
+            Self {
+                fabric_mgr <- RefCell::init(FabricMgr::init()),
+                pase_mgr <- RefCell::init(PaseMgr::init(epoch, rand)),
+                failsafe: RefCell::new(FailSafe::new(epoch, rand)),
+                transport_mgr <- TransportMgr::init(mdns, dev_det, port, epoch, rand),
+                persist_notification: Notification::new(),
+                epoch,
+                rand,
+                dev_det,
+                dev_comm,
+                dev_att,
+                port,
+                display_qrcode_callback: None,
+                clear_display_callback: None,
+            }
+        )
     }
 
     pub fn initialize_transport_buffers(&self) -> Result<(), Error> {
@@ -135,6 +227,10 @@ impl<'a> Matter<'a> {
         self.dev_att
     }
 
+    pub fn dev_comm(&self) -> &BasicCommData {
+        &self.dev_comm
+    }
+
     pub fn port(&self) -> u16 {
         self.port
     }
@@ -145,6 +241,14 @@ impl<'a> Matter<'a> {
 
     pub fn epoch(&self) -> Epoch {
         self.epoch
+    }
+
+    pub fn transport_rx_buffer(&self) -> impl BufferAccess<[u8]> + '_ {
+        self.transport_mgr.rx_buffer()
+    }
+
+    pub fn transport_tx_buffer(&self) -> impl BufferAccess<[u8]> + '_ {
+        self.transport_mgr.tx_buffer()
     }
 
     /// A utility method to replace the initial mDNS implementation with another one.
@@ -161,8 +265,7 @@ impl<'a> Matter<'a> {
     /// after that - while/if we still have exclusive, mutable access to the `Matter` object -
     /// replace the `MdnsService::Disabled` initial impl with another, like `MdnsService::Provided`.
     pub fn replace_mdns(&mut self, mdns: MdnsService<'a>) {
-        self.transport_mgr
-            .replace_mdns(mdns.new_impl(self.dev_det, self.port));
+        self.transport_mgr.replace_mdns(mdns);
     }
 
     /// A utility method to replace the initial Device Attestation Data Fetcher with another one.
@@ -178,20 +281,12 @@ impl<'a> Matter<'a> {
             .load(data, &self.transport_mgr.mdns)
     }
 
-    pub fn load_acls(&self, data: &[u8]) -> Result<(), Error> {
-        self.acl_mgr.borrow_mut().load(data)
-    }
-
     pub fn store_fabrics<'b>(&self, buf: &'b mut [u8]) -> Result<Option<&'b [u8]>, Error> {
         self.fabric_mgr.borrow_mut().store(buf)
     }
 
-    pub fn store_acls<'b>(&self, buf: &'b mut [u8]) -> Result<Option<&'b [u8]>, Error> {
-        self.acl_mgr.borrow_mut().store(buf)
-    }
-
-    pub fn is_changed(&self) -> bool {
-        self.acl_mgr.borrow().is_changed() || self.fabric_mgr.borrow().is_changed()
+    pub fn fabrics_changed(&self) -> bool {
+        self.fabric_mgr.borrow().is_changed()
     }
 
     /// Return `true` if there is at least one commissioned fabric
@@ -206,35 +301,73 @@ impl<'a> Matter<'a> {
     // after we receive `CommissioningComplete` on behalf of a Case session
     // for the fabric in question.
     pub fn is_commissioned(&self) -> bool {
-        self.fabric_mgr.borrow().used_count() > 0
+        self.fabric_mgr.borrow().iter().count() > 0
     }
 
-    fn start_comissioning(
+    /// Enable basic commissioning by setting up a PASE session and printing the pairing code and QR code.
+    ///
+    /// The method will return an error if there is not enough space in the buffer to print the pairing code and QR code
+    /// or if the PASE session could not be set up (due to another PASE session already being active, for example).
+    ///
+    /// Parameters:
+    /// * `discovery_capabilities`: The discovery capabilities of the device (IP, BLE or Soft-AP)
+    /// * `timeout_secs`: The timeout in seconds for the basic commissioning session
+    pub async fn enable_basic_commissioning(
         &self,
-        dev_comm: CommissioningData,
         discovery_capabilities: DiscoveryCapabilities,
-        buf: &mut [u8],
-    ) -> Result<bool, Error> {
-        if !self.pase_mgr.borrow().is_pase_session_enabled() && self.fabric_mgr.borrow().is_empty()
-        {
-            print_pairing_code_and_qr(
-                self.dev_det,
-                &dev_comm,
-                discovery_capabilities,
-                buf,
-                &self.display_qrcode_callback,
-            )?;
+        timeout_secs: u16,
+    ) -> Result<(), Error> {
+        let buf_access = PacketBufferExternalAccess(&self.transport_mgr.rx);
+        let mut buf = buf_access.get().await.ok_or(ErrorCode::NoSpace)?;
 
-            self.pase_mgr.borrow_mut().enable_pase_session(
-                dev_comm.verifier,
-                dev_comm.discriminator,
-                &self.transport_mgr.mdns,
-            )?;
+        self.pase_mgr.borrow_mut().enable_basic_pase_session(
+            self.dev_comm.password,
+            self.dev_comm.discriminator,
+            timeout_secs,
+            &self.transport_mgr.mdns,
+        )?;
 
-            Ok(true)
-        } else {
-            Ok(false)
+        print_pairing_code_and_qr(
+            self.dev_det,
+            &self.dev_comm,
+            discovery_capabilities,
+            &mut buf,
+            &self.display_qrcode_callback,
+        )?;
+
+        Ok(())
+    }
+
+    /// Disable the basic commissioning session
+    ///
+    /// The method will return Ok(false) if there is no active PASE session to disable.
+    pub fn disable_commissioning(&self) -> Result<bool, Error> {
+        self.pase_mgr
+            .borrow_mut()
+            .disable_pase_session(&self.transport_mgr.mdns)
+    }
+
+    /// Run the transport layer
+    ///
+    /// Enables basic commissioning if the device is not commissioned
+    /// Note that the fabrics should be loaded by the PSM before calling this method
+    /// or else commissioning will be always enabled.
+    pub async fn run<S, R>(
+        &self,
+        send: S,
+        recv: R,
+        discovery_capabilities: DiscoveryCapabilities,
+    ) -> Result<(), Error>
+    where
+        S: NetworkSend,
+        R: NetworkReceive,
+    {
+        if !self.is_commissioned() {
+            self.enable_basic_commissioning(discovery_capabilities, 0 /*TODO*/)
+                .await?;
         }
+
+        self.run_transport(send, recv).await
     }
 
     /// Resets the transport layer by clearing all sessions, exchanges, the RX buffer and the TX buffer
@@ -243,23 +376,12 @@ impl<'a> Matter<'a> {
         self.transport_mgr.reset()
     }
 
-    pub async fn run<S, R>(
-        &self,
-        send: S,
-        recv: R,
-        dev_comm: Option<(CommissioningData, DiscoveryCapabilities)>,
-    ) -> Result<(), Error>
+    /// Run the transport layer
+    pub async fn run_transport<S, R>(&self, send: S, recv: R) -> Result<(), Error>
     where
         S: NetworkSend,
         R: NetworkReceive,
     {
-        if let Some((dev_comm, discovery_caps)) = dev_comm {
-            let buf_access = PacketBufferExternalAccess(&self.transport_mgr.rx);
-            let mut buf = buf_access.get().await.ok_or(ErrorCode::NoSpace)?;
-
-            self.start_comissioning(dev_comm, discovery_caps, &mut buf)?;
-        }
-
         self.transport_mgr.run(send, recv).await
     }
 
@@ -272,14 +394,15 @@ impl<'a> Matter<'a> {
         send: S,
         recv: R,
         host: &crate::mdns::Host<'_>,
-        interface: Option<u32>,
+        ipv4_interface: Option<core::net::Ipv4Addr>,
+        ipv6_interface: Option<u32>,
     ) -> Result<(), Error>
     where
         S: NetworkSend,
         R: NetworkReceive,
     {
         self.transport_mgr
-            .run_builtin_mdns(send, recv, host, interface)
+            .run_builtin_mdns(send, recv, host, ipv4_interface, ipv6_interface)
             .await
     }
 
@@ -289,8 +412,8 @@ impl<'a> Matter<'a> {
     /// The default IM and SC handlers (`DataModel` and `SecureChannel`) do call this method after processing the messages.
     ///
     /// TODO: Fix the method name as it is not clear enough. Potentially revamp the whole persistence notification logic
-    pub fn notify_changed(&self) {
-        if self.is_changed() {
+    pub fn notify_fabrics_maybe_changed(&self) {
+        if self.fabrics_changed() {
             self.persist_notification.notify();
         }
     }
@@ -300,7 +423,7 @@ impl<'a> Matter<'a> {
     /// if there are changes, persist them.
     ///
     /// TODO: Fix the method name as it is not clear enough. Potentially revamp the whole persistence notification logic
-    pub async fn wait_changed(&self) {
+    pub async fn wait_fabrics_changed(&self) {
         self.persist_notification.wait().await
     }
 }

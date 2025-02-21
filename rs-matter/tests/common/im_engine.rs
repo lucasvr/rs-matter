@@ -65,7 +65,7 @@ use rs_matter::{
         },
         session::{NocCatIds, ReservedSession, SessionMode},
     },
-    utils::{buf::PooledBuffers, select::Coalesce},
+    utils::{select::Coalesce, storage::pooled::PooledBuffers},
     Matter, MATTER_PORT,
 };
 
@@ -109,7 +109,7 @@ const NODE: Node<'static> = Node {
                 access_control::CLUSTER,
                 echo_cluster::CLUSTER,
             ],
-            device_type: DEV_TYPE_ROOT_NODE,
+            device_types: &[DEV_TYPE_ROOT_NODE],
         },
         Endpoint {
             id: 1,
@@ -118,7 +118,7 @@ const NODE: Node<'static> = Node {
                 cluster_on_off::CLUSTER,
                 echo_cluster::CLUSTER,
             ],
-            device_type: DEV_TYPE_ON_OFF_LIGHT,
+            device_types: &[DEV_TYPE_ON_OFF_LIGHT],
         },
     ],
 };
@@ -295,7 +295,7 @@ impl<'a> ImEngine<'a> {
                 ADDR,
                 SessionMode::Case {
                     fab_idx: NonZeroU8::new(1).unwrap(),
-                    cat_ids: cat_ids.clone(),
+                    cat_ids: *cat_ids,
                 },
                 None,
                 None,

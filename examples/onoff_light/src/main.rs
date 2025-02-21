@@ -16,6 +16,7 @@
  */
 
 use core::pin::pin;
+
 use std::net::UdpSocket;
 
 use embassy_futures::select::{select, select4};
@@ -24,7 +25,7 @@ use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_time::{Duration, Timer};
 use log::info;
 
-use rs_matter::core::{CommissioningData, Matter};
+use rs_matter::core::{BasicCommData, Matter, MATTER_PORT};
 use rs_matter::data_model::cluster_basic_information::BasicInfoConfig;
 use rs_matter::data_model::cluster_on_off;
 use rs_matter::data_model::core::IMBuffer;
@@ -35,15 +36,44 @@ use rs_matter::data_model::subscriptions::Subscriptions;
 use rs_matter::data_model::system_model::descriptor;
 use rs_matter::error::Error;
 use rs_matter::mdns::MdnsService;
+use rs_matter::pairing::DiscoveryCapabilities;
 use rs_matter::persist::Psm;
 use rs_matter::respond::DefaultResponder;
-use rs_matter::secure_channel::spake2p::VerifierData;
 use rs_matter::transport::core::MATTER_SOCKET_BIND_ADDR;
-use rs_matter::utils::buf::PooledBuffers;
+use rs_matter::utils::init::InitMaybeUninit;
 use rs_matter::utils::select::Coalesce;
-use rs_matter::MATTER_PORT;
+use rs_matter::utils::storage::pooled::PooledBuffers;
+
+use static_cell::StaticCell;
 
 mod dev_att;
+
+static DEV_DET: BasicInfoConfig = BasicInfoConfig {
+    vid: 0xFFF1,
+    pid: 0x8001,
+    hw_ver: 2,
+    sw_ver: 1,
+    sw_ver_str: "1",
+    serial_no: "aabbccdd",
+    device_name: "OnOff Light",
+    product_name: "Light123",
+    vendor_name: "Vendor PQR",
+};
+
+static DEV_COMM: BasicCommData = BasicCommData {
+    password: 20202021,
+    discriminator: 3840,
+};
+
+static DEV_ATT: dev_att::HardCodedDevAtt = dev_att::HardCodedDevAtt::new();
+
+static MATTER: StaticCell<Matter> = StaticCell::new();
+
+static BUFFERS: StaticCell<PooledBuffers<10, NoopRawMutex, IMBuffer>> = StaticCell::new();
+
+static SUBSCRIPTIONS: StaticCell<Subscriptions<3>> = StaticCell::new();
+
+static PSM: StaticCell<Psm<4096>> = StaticCell::new();
 
 fn main() -> Result<(), Error> {
     let thread = std::thread::Builder::new()
@@ -54,7 +84,7 @@ fn main() -> Result<(), Error> {
         // e.g., an opt-level of "0" will require a several times' larger stack.
         //
         // Optimizing/lowering `rs-matter` memory consumption is an ongoing topic.
-        .stack_size(95 * 1024)
+        .stack_size(45 * 1024)
         .spawn(run)
         .unwrap();
 
@@ -67,65 +97,52 @@ fn run() -> Result<(), Error> {
     );
 
     info!(
-        "Matter memory: Matter={}B, IM Buffers={}B",
+        "Matter memory: Matter (BSS)={}B, IM Buffers (BSS)={}B, Subscriptions (BSS)={}B",
         core::mem::size_of::<Matter>(),
-        core::mem::size_of::<PooledBuffers<10, NoopRawMutex, IMBuffer>>()
+        core::mem::size_of::<PooledBuffers<10, NoopRawMutex, IMBuffer>>(),
+        core::mem::size_of::<Subscriptions<3>>()
     );
 
-    let dev_det = BasicInfoConfig {
-        vid: 0xFFF1,
-        pid: 0x8000,
-        hw_ver: 2,
-        sw_ver: 1,
-        sw_ver_str: "1",
-        serial_no: "aabbccdd",
-        device_name: "OnOff Light",
-        product_name: "Light123",
-        vendor_name: "Vendor PQR",
-    };
-
-    let dev_att = dev_att::HardCodedDevAtt::new();
-
-    let matter = Matter::new(
-        &dev_det,
-        &dev_att,
+    let matter = MATTER.uninit().init_with(Matter::init(
+        &DEV_DET,
+        DEV_COMM,
+        &DEV_ATT,
         // NOTE:
         // For `no_std` environments, provide your own epoch and rand functions here
         MdnsService::Builtin,
         rs_matter::utils::epoch::sys_epoch,
         rs_matter::utils::rand::sys_rand,
         MATTER_PORT,
-    );
+    ));
 
     matter.initialize_transport_buffers()?;
 
     info!("Matter initialized");
 
-    let buffers = PooledBuffers::<10, NoopRawMutex, _>::new(0);
+    let buffers = BUFFERS.uninit().init_with(PooledBuffers::init(0));
 
     info!("IM buffers initialized");
 
-    let mut mdns = pin!(run_mdns(&matter));
-
     let on_off = cluster_on_off::OnOffCluster::new(Dataver::new_rand(matter.rand()), None);
 
-    let subscriptions = Subscriptions::<3>::new();
+    let subscriptions = SUBSCRIPTIONS.uninit().init_with(Subscriptions::init());
 
     // Assemble our Data Model handler by composing the predefined Root Endpoint handler with our custom On/Off clusters
     let dm_handler = HandlerCompat(dm_handler(&matter, &on_off));
 
     // Create a default responder capable of handling up to 3 subscriptions
     // All other subscription requests will be turned down with "resource exhausted"
-    let responder = DefaultResponder::new(&matter, &buffers, &subscriptions, dm_handler);
+    let responder = DefaultResponder::new(&matter, buffers, &subscriptions, dm_handler);
     info!(
-        "Responder memory: Responder={}B, Runner={}B",
+        "Responder memory: Responder (stack)={}B, Runner fut (stack)={}B",
         core::mem::size_of_val(&responder),
         core::mem::size_of_val(&responder.run::<4, 4>())
     );
 
-    // Run the responder with up to 4 handlers (i.e. 4 exchanges can be handled simultenously)
+    // Run the responder with up to 4 handlers (i.e. 4 exchanges can be handled simultaneously)
     // Clients trying to open more exchanges than the ones currently running will get "I'm busy, please try again later"
     let mut respond = pin!(responder.run::<4, 4>());
+    //let mut respond = responder_fut(responder);
 
     // This is a sample code that simulates state changes triggered by the HAL
     // Changes will be properly communicated to the Matter controllers and other Matter apps (i.e. Google Home, Alexa), thanks to subscriptions
@@ -146,23 +163,31 @@ fn run() -> Result<(), Error> {
     let socket = async_io::Async::<UdpSocket>::bind(MATTER_SOCKET_BIND_ADDR)?;
 
     // Run the Matter and mDNS transports
-    let mut transport = pin!(matter.run(
-        &socket,
-        &socket,
-        Some((
-            CommissioningData {
-                // TODO: Hard-coded for now
-                verifier: VerifierData::new_with_pw(123456, matter.rand()),
-                discriminator: 250,
-            },
-            Default::default(),
-        )),
-    ));
+    info!(
+        "Transport memory: Transport fut (stack)={}B, mDNS fut (stack)={}B",
+        core::mem::size_of_val(&matter.run(&socket, &socket, DiscoveryCapabilities::IP)),
+        core::mem::size_of_val(&run_mdns(&matter))
+    );
+
+    let mut mdns = pin!(run_mdns(&matter));
+
+    let mut transport = pin!(matter.run(&socket, &socket, DiscoveryCapabilities::IP));
 
     // NOTE:
     // Replace with your own persister for e.g. `no_std` environments
-    let mut psm = Psm::new(&matter, std::env::temp_dir().join("rs-matter"))?;
-    let mut persist = pin!(psm.run());
+    let psm = PSM.uninit().init_with(Psm::init());
+
+    info!(
+        "Persist memory: Persist (BSS)={}B, Persist fut (stack)={}B",
+        core::mem::size_of::<Psm<4096>>(),
+        core::mem::size_of_val(&psm.run(std::env::temp_dir().join("rs-matter"), &matter))
+    );
+
+    let dir = std::env::temp_dir().join("rs-matter");
+
+    psm.load(&dir, &matter)?;
+
+    let mut persist = pin!(psm.run(dir, &matter));
 
     // Combine all async tasks in a single one
     let all = select4(
@@ -177,13 +202,22 @@ fn run() -> Result<(), Error> {
     futures_lite::future::block_on(all.coalesce())
 }
 
+// #[inline(never)]
+// pub fn responder_fut<const N: usize, B, T>(responder: &'static DefaultResponder<N, B, T>) -> Box<impl Future<Output = Result<(), Error>>>
+// where
+//     B: BufferAccess<IMBuffer>,
+//     T: DataModelHandler,
+// {
+//     Box::new(responder.run::<4, 4>())
+// }
+
 const NODE: Node<'static> = Node {
     id: 0,
     endpoints: &[
         root_endpoint::endpoint(0, root_endpoint::OperNwType::Ethernet),
         Endpoint {
             id: 1,
-            device_type: DEV_TYPE_ON_OFF_LIGHT,
+            device_types: &[DEV_TYPE_ON_OFF_LIGHT],
             clusters: &[descriptor::CLUSTER, cluster_on_off::CLUSTER],
         },
     ],
@@ -223,6 +257,7 @@ async fn run_mdns(matter: &Matter<'_>) -> Result<(), Error> {
 
     // NOTE:
     // Replace with your own network initialization for e.g. `no_std` environments
+    #[inline(never)]
     fn initialize_network() -> Result<(Ipv4Addr, Ipv6Addr, u32), Error> {
         use log::error;
         use nix::{net::if_::InterfaceFlags, sys::socket::SockaddrIn6};
@@ -294,9 +329,10 @@ async fn run_mdns(matter: &Matter<'_>) -> Result<(), Error> {
             &Host {
                 id: 0,
                 hostname: "rs-matter-demo",
-                ip: ipv4_addr.octets(),
-                ipv6: Some(ipv6_addr.octets()),
+                ip: ipv4_addr,
+                ipv6: ipv6_addr,
             },
+            Some(ipv4_addr),
             Some(interface),
         )
         .await

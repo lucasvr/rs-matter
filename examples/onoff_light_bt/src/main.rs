@@ -42,7 +42,7 @@ use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_time::{Duration, Timer};
 use log::{info, warn};
 
-use rs_matter::core::{CommissioningData, Matter};
+use rs_matter::core::{BasicCommData, Matter};
 use rs_matter::data_model::cluster_basic_information::BasicInfoConfig;
 use rs_matter::data_model::cluster_on_off;
 use rs_matter::data_model::core::IMBuffer;
@@ -59,13 +59,11 @@ use rs_matter::mdns::MdnsService;
 use rs_matter::pairing::DiscoveryCapabilities;
 use rs_matter::persist::Psm;
 use rs_matter::respond::DefaultResponder;
-use rs_matter::secure_channel::spake2p::VerifierData;
 use rs_matter::transport::core::MATTER_SOCKET_BIND_ADDR;
 use rs_matter::transport::network::btp::{Btp, BtpContext};
-use rs_matter::utils::buf::PooledBuffers;
-use rs_matter::utils::notification::Notification;
 use rs_matter::utils::select::Coalesce;
-use rs_matter::utils::std_mutex::StdRawMutex;
+use rs_matter::utils::storage::pooled::PooledBuffers;
+use rs_matter::utils::sync::{blocking::raw::StdRawMutex, Notification};
 use rs_matter::MATTER_PORT;
 
 mod comm;
@@ -114,10 +112,16 @@ fn run() -> Result<(), Error> {
         vendor_name: "Vendor PQR",
     };
 
+    let dev_comm = BasicCommData {
+        password: 20202021,
+        discriminator: 3840,
+    };
+
     let dev_att = dev_att::HardCodedDevAtt::new();
 
     let matter = Matter::new(
         &dev_det,
+        dev_comm,
         &dev_att,
         // NOTE:
         // For `no_std` environments, provide your own epoch and rand functions here
@@ -126,14 +130,6 @@ fn run() -> Result<(), Error> {
         rs_matter::utils::rand::sys_rand,
         MATTER_PORT,
     );
-
-    let dev_comm = CommissioningData {
-        // TODO: Hard-coded for now
-        verifier: VerifierData::new_with_pw(123456, matter.rand()),
-        discriminator: 250,
-    };
-
-    let discovery_caps = DiscoveryCapabilities::new(false, true, false);
 
     matter.initialize_transport_buffers()?;
 
@@ -182,16 +178,22 @@ fn run() -> Result<(), Error> {
 
     // NOTE:
     // Replace with your own persister for e.g. `no_std` environments
-    let mut psm = Psm::new(&matter, std::env::temp_dir().join("rs-matter"))?;
-    let mut persist = pin!(psm.run());
+
+    let mut psm: Psm<4096> = Psm::new();
+
+    let dir = std::env::temp_dir().join("rs-matter");
+
+    psm.load(&dir, &matter)?;
+
+    let mut persist = pin!(psm.run(dir, &matter));
 
     if !matter.is_commissioned() {
         // Not commissioned yet, start commissioning first
 
         let btp = Btp::new_builtin(&BTP_CONTEXT);
-        let mut bluetooth = pin!(btp.run("MT", &dev_det, &dev_comm));
+        let mut bluetooth = pin!(btp.run("MT", &dev_det, dev_comm.discriminator));
 
-        let mut transport = pin!(matter.run(&btp, &btp, Some((dev_comm, discovery_caps))));
+        let mut transport = pin!(matter.run(&btp, &btp, DiscoveryCapabilities::BLE));
 
         let mut wifi_complete_task = pin!(async {
             wifi_complete.wait().await;
@@ -224,7 +226,7 @@ fn run() -> Result<(), Error> {
     let udp = async_io::Async::<UdpSocket>::bind(MATTER_SOCKET_BIND_ADDR)?;
 
     // Run the Matter transport
-    let mut transport = pin!(matter.run(&udp, &udp, None));
+    let mut transport = pin!(matter.run_transport(&udp, &udp));
 
     // Combine all async tasks in a single one
     let all = select4(
@@ -245,7 +247,7 @@ const NODE: Node<'static> = Node {
         root_endpoint::endpoint(0, root_endpoint::OperNwType::Wifi),
         Endpoint {
             id: 1,
-            device_type: DEV_TYPE_ON_OFF_LIGHT,
+            device_types: &[DEV_TYPE_ON_OFF_LIGHT],
             clusters: &[descriptor::CLUSTER, cluster_on_off::CLUSTER],
         },
     ],
@@ -376,9 +378,10 @@ async fn run_mdns(matter: &Matter<'_>) -> Result<(), Error> {
             &Host {
                 id: 0,
                 hostname: "rs-matter-demo",
-                ip: ipv4_addr.octets(),
-                ipv6: Some(ipv6_addr.octets()),
+                ip: ipv4_addr,
+                ipv6: ipv6_addr,
             },
+            Some(ipv4_addr),
             Some(interface),
         )
         .await

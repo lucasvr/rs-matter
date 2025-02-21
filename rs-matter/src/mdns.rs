@@ -17,7 +17,11 @@
 
 use core::fmt::Write;
 
-use crate::{data_model::cluster_basic_information::BasicInfoConfig, error::Error};
+use log::info;
+
+use crate::data_model::cluster_basic_information::BasicInfoConfig;
+use crate::error::Error;
+use crate::utils::init::{init, Init};
 
 #[cfg(all(feature = "std", target_os = "macos"))]
 #[path = "mdns/astro.rs"]
@@ -98,49 +102,77 @@ pub enum MdnsService<'a> {
     Provided(&'a dyn Mdns),
 }
 
-impl<'a> MdnsService<'a> {
-    pub(crate) const fn new_impl(
-        &self,
+pub(crate) struct MdnsImpl<'a> {
+    service: MdnsService<'a>,
+    builtin: builtin::MdnsImpl<'a>,
+}
+
+impl<'a> MdnsImpl<'a> {
+    pub(crate) const fn new(
+        service: MdnsService<'a>,
         dev_det: &'a BasicInfoConfig<'a>,
         matter_port: u16,
-    ) -> MdnsImpl<'a> {
-        match self {
-            Self::Disabled => MdnsImpl::Disabled,
-            Self::Builtin => MdnsImpl::Builtin(builtin::MdnsImpl::new(dev_det, matter_port)),
-            Self::Provided(mdns) => MdnsImpl::Provided(*mdns),
+    ) -> Self {
+        Self {
+            service,
+            builtin: builtin::MdnsImpl::new(dev_det, matter_port),
         }
+    }
+
+    pub(crate) fn init(
+        service: MdnsService<'a>,
+        dev_det: &'a BasicInfoConfig<'a>,
+        matter_port: u16,
+    ) -> impl Init<Self> {
+        init!(Self {
+            service,
+            builtin <- builtin::MdnsImpl::init(dev_det, matter_port),
+        })
+    }
+
+    #[allow(unused)]
+    pub(crate) fn builtin(&self) -> Option<&builtin::MdnsImpl> {
+        matches!(self.service, MdnsService::Builtin).then_some(&self.builtin)
+    }
+
+    pub(crate) fn update(&mut self, service: MdnsService<'a>) {
+        self.service = service;
     }
 }
 
-pub(crate) enum MdnsImpl<'a> {
-    Disabled,
-    Builtin(builtin::MdnsImpl<'a>),
-    Provided(&'a dyn Mdns),
-}
-
-impl<'a> Mdns for MdnsImpl<'a> {
+impl Mdns for MdnsImpl<'_> {
     fn reset(&self) {
-        match self {
-            Self::Disabled => {}
-            Self::Builtin(mdns) => mdns.reset(),
-            Self::Provided(mdns) => mdns.reset(),
+        match self.service {
+            MdnsService::Disabled => {}
+            MdnsService::Builtin => self.builtin.reset(),
+            MdnsService::Provided(mdns) => mdns.reset(),
         }
     }
 
     fn add(&self, service: &str, mode: ServiceMode) -> Result<(), Error> {
-        match self {
-            Self::Disabled => Ok(()),
-            Self::Builtin(mdns) => mdns.add(service, mode),
-            Self::Provided(mdns) => mdns.add(service, mode),
-        }
+        match self.service {
+            MdnsService::Disabled => Ok(()),
+            MdnsService::Builtin => self.builtin.add(service, mode),
+            MdnsService::Provided(mdns) => mdns.add(service, mode),
+        }?;
+
+        // Do not remove this logging line or change its formatting.
+        // C++ E2E tests rely on this log line to determine when the mDNS service is published
+        info!("mDNS service published: {service}::{mode:?}");
+
+        Ok(())
     }
 
     fn remove(&self, service: &str) -> Result<(), Error> {
-        match self {
-            Self::Disabled => Ok(()),
-            Self::Builtin(mdns) => mdns.remove(service),
-            Self::Provided(mdns) => mdns.remove(service),
-        }
+        match self.service {
+            MdnsService::Disabled => Ok(()),
+            MdnsService::Builtin => self.builtin.remove(service),
+            MdnsService::Provided(mdns) => mdns.remove(service),
+        }?;
+
+        info!("mDNS service removed: {service}");
+
+        Ok(())
     }
 }
 
@@ -153,7 +185,7 @@ pub struct Service<'a> {
     pub txt_kvs: &'a [(&'a str, &'a str)],
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum ServiceMode {
     /// The commissioned state
     Commissioned,
@@ -201,6 +233,7 @@ impl ServiceMode {
                     service_subtypes: &[
                         &Self::get_long_service_subtype(*discriminator),
                         &Self::get_short_service_type(*discriminator),
+                        "_CM",
                     ],
                     txt_kvs,
                 })

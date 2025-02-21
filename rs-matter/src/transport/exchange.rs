@@ -27,7 +27,8 @@ use crate::acl::Accessor;
 use crate::error::{Error, ErrorCode};
 use crate::interaction_model::{self, core::PROTO_ID_INTERACTION_MODEL};
 use crate::secure_channel::{self, common::PROTO_ID_SECURE_CHANNEL};
-use crate::utils::{epoch::Epoch, writebuf::WriteBuf};
+use crate::utils::epoch::Epoch;
+use crate::utils::storage::WriteBuf;
 use crate::Matter;
 
 use super::core::{Packet, PacketAccess, MAX_RX_BUF_SIZE, MAX_TX_BUF_SIZE};
@@ -212,7 +213,7 @@ impl ExchangeId {
 
     fn accessor<'a>(&self, matter: &'a Matter<'a>) -> Result<Accessor<'a>, Error> {
         self.with_session(matter, |sess| {
-            Ok(Accessor::for_session(sess, &matter.acl_mgr))
+            Ok(Accessor::for_session(sess, &matter.fabric_mgr))
         })
     }
 
@@ -298,7 +299,7 @@ pub struct ExchangeIdDisplay<'a> {
     session: &'a Session,
 }
 
-impl<'a> Display for ExchangeIdDisplay<'a> {
+impl Display for ExchangeIdDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let state = self.session.exchanges[self.id.exchange_index()].as_ref();
 
@@ -529,7 +530,7 @@ impl Display for MessageMeta {
 /// An RX message pending on an `Exchange` instance.
 pub struct RxMessage<'a>(PacketAccess<'a, MAX_RX_BUF_SIZE>);
 
-impl<'a> RxMessage<'a> {
+impl RxMessage<'_> {
     /// Get the meta-data of the pending message
     pub fn meta(&self) -> MessageMeta {
         MessageMeta::from(&self.0.header.proto)
@@ -554,7 +555,7 @@ pub struct TxMessage<'a> {
     packet: PacketAccess<'a, MAX_TX_BUF_SIZE>,
 }
 
-impl<'a> TxMessage<'a> {
+impl TxMessage<'_> {
     /// Get a reference to the payload buffer of the TX message being built
     pub fn payload(&mut self) -> &mut [u8] {
         &mut self.packet.buf[PacketHdr::HDR_RESERVE..MAX_TX_BUF_SIZE - PacketHdr::TAIL_RESERVE]
@@ -659,7 +660,7 @@ pub struct SenderTx<'a, 'b> {
     message: TxMessage<'a>,
 }
 
-impl<'a, 'b> SenderTx<'a, 'b> {
+impl SenderTx<'_, '_> {
     pub fn split(&mut self) -> (&Exchange<'_>, &mut [u8]) {
         (self.sender.exchange, self.message.payload())
     }
@@ -1113,7 +1114,7 @@ impl<'a> Exchange<'a> {
     }
 }
 
-impl<'a> Drop for Exchange<'a> {
+impl Drop for Exchange<'_> {
     fn drop(&mut self) {
         let closed = self.with_ctx(|sess, exch_index| Ok(sess.remove_exch(exch_index)));
 
@@ -1123,7 +1124,7 @@ impl<'a> Drop for Exchange<'a> {
     }
 }
 
-impl<'a> Display for Exchange<'a> {
+impl Display for Exchange<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.id)
     }
