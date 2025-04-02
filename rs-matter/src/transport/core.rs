@@ -79,6 +79,8 @@ pub struct TransportMgr<'m> {
     pub(crate) mdns: MdnsImpl<'m>,
     #[allow(dead_code)]
     rand: Rand,
+    device_sai: Option<u16>,
+    device_sii: Option<u16>,
 }
 
 impl<'m> TransportMgr<'m> {
@@ -98,6 +100,8 @@ impl<'m> TransportMgr<'m> {
             session_mgr: RefCell::new(SessionMgr::new(epoch, rand)),
             mdns: MdnsImpl::new(service, dev_det, matter_port),
             rand,
+            device_sai: dev_det.sai,
+            device_sii: dev_det.sii,
         }
     }
 
@@ -116,6 +120,8 @@ impl<'m> TransportMgr<'m> {
             session_mgr <- RefCell::init(SessionMgr::init(epoch, rand)),
             mdns <- MdnsImpl::init(service, dev_det, matter_port),
             rand,
+            device_sai: dev_det.sai,
+            device_sii: dev_det.sii,
         })
     }
 
@@ -484,12 +490,13 @@ impl<'m> TransportMgr<'m> {
         let result = self.decode_packet(packet);
         match result {
             Err(e) if matches!(e.code(), ErrorCode::Duplicate) => {
-                if !packet.peer.is_reliable() {
-                    info!("\n>>>>> {packet}\n => Duplicate, sending ACK");
+                if !packet.peer.is_reliable()
+                    && !MessageMeta::from(&packet.header.proto).is_standalone_ack()
+                {
+                    info!("\n>>RCV {packet}\n      => Duplicate, sending ACK");
 
                     {
                         let mut session_mgr = self.session_mgr.borrow_mut();
-                        let epoch = session_mgr.epoch;
 
                         // `unwrap` is safe because we know we have a session.
                         // If we didn't have a session, the error code would've been `NoSession`
@@ -505,7 +512,7 @@ impl<'m> TransportMgr<'m> {
                         packet.header.proto.toggle_initiator();
                         packet.header.proto.set_ack(Some(ack));
 
-                        self.encode_packet(packet, Some(session), None, epoch, |_| {
+                        self.encode_packet(packet, Some(session), None, |_| {
                             Ok(Some(OpCode::MRPStandAloneAck.into()))
                         })?;
                     }
@@ -513,27 +520,23 @@ impl<'m> TransportMgr<'m> {
                     Self::netw_send(send, packet.peer, &packet.buf[packet.payload_start..], true)
                         .await?;
                 } else {
-                    info!("\n>>>>> {packet}\n => Duplicate, discarding");
+                    info!("\n>>RCV {packet}\n      => Duplicate, discarding");
                 }
             }
             Err(e) if matches!(e.code(), ErrorCode::NoSpaceSessions) => {
                 if !packet.header.plain.is_encrypted()
                     && MessageMeta::from(&packet.header.proto).is_new_session()
                 {
-                    warn!("\n>>>>> {packet}\n => No space for a new unencrypted session, sending Busy");
+                    warn!("\n>>RCV {packet}\n      => No space for a new unencrypted session, sending Busy");
 
                     let ack = packet.header.plain.ctr;
 
                     packet.header.proto.toggle_initiator();
                     packet.header.proto.set_ack(Some(ack));
 
-                    self.encode_packet(
-                        packet,
-                        None,
-                        None,
-                        self.session_mgr.borrow().epoch,
-                        |wb| sc_write(wb, SCStatusCodes::Busy, &[0xF4, 0x01]),
-                    )?;
+                    self.encode_packet(packet, None, None, |wb| {
+                        sc_write(wb, SCStatusCodes::Busy, &[0xF4, 0x01])
+                    })?;
 
                     Self::netw_send(send, packet.peer, &packet.buf[packet.payload_start..], true)
                         .await?;
@@ -548,7 +551,9 @@ impl<'m> TransportMgr<'m> {
                         .await?;
                     }
                 } else {
-                    error!("\n>>>>> {packet}\n => No space for a new encrypted session, dropping");
+                    error!(
+                        "\n>>RCV {packet}\n      => No space for a new encrypted session, dropping"
+                    );
                 }
             }
             Err(e) if matches!(e.code(), ErrorCode::NoSpaceExchanges) => {
@@ -558,7 +563,7 @@ impl<'m> TransportMgr<'m> {
                 //   wait for ACK and retransmit without releasing the RX buffer, potentially
                 //   blocking all other interactions
 
-                error!("\n>>>>> {packet}\n => No space for a new exchange, closing session");
+                error!("\n>>RCV {packet}\n      => No space for a new exchange, closing session");
 
                 {
                     let mut session_mgr = self.session_mgr.borrow_mut();
@@ -580,40 +585,38 @@ impl<'m> TransportMgr<'m> {
                     let mut session = session_mgr.remove(session_id).unwrap();
                     self.session_removed.notify();
 
-                    self.encode_packet(
-                        packet,
-                        Some(&mut session),
-                        None,
-                        session_mgr.epoch,
-                        |wb| sc_write(wb, SCStatusCodes::CloseSession, &[]),
-                    )?;
+                    self.encode_packet(packet, Some(&mut session), None, |wb| {
+                        sc_write(wb, SCStatusCodes::CloseSession, &[])
+                    })?;
                 }
 
                 Self::netw_send(send, packet.peer, &packet.buf[packet.payload_start..], true)
                     .await?;
             }
             Err(e) if matches!(e.code(), ErrorCode::NoExchange) => {
-                warn!("\n>>>>> {packet}\n => No valid exchange found, dropping");
+                warn!("\n>>RCV {packet}\n      => No valid exchange found, dropping");
             }
             Err(e) if matches!(e.code(), ErrorCode::NoSession) => {
-                warn!("\n>>>>> {packet}\n => No valid session found, dropping");
+                warn!("\n>>RCV {packet}\n      => No valid session found, dropping");
             }
             Err(e) => {
-                error!("\n>>>>> {packet}\n => Error ({e:?}), dropping");
+                error!("\n>>RCV {packet}\n      => Error ({e:?}), dropping");
             }
             Ok(new_exchange) => {
                 let meta = MessageMeta::from(&packet.header.proto);
 
                 if meta.is_standalone_ack() {
                     // No need to propagate this further
-                    info!("\n>>>>> {packet}\n => Standalone Ack, dropping");
+                    info!("\n>>RCV {packet}\n      => Standalone Ack, dropping");
                 } else if meta.is_sc_status()
                     && matches!(
                         Self::is_close_session(&mut packet.buf[packet.payload_start..]),
                         Ok(true)
                     )
                 {
-                    warn!("\n>>>>> {packet}\n => Close session received, removing this session");
+                    warn!(
+                        "\n>>RCV {packet}\n      => Close session received, removing this session"
+                    );
 
                     let mut session_mgr = self.session_mgr.borrow_mut();
                     if let Some(session_id) = session_mgr
@@ -625,7 +628,7 @@ impl<'m> TransportMgr<'m> {
                     }
                 } else {
                     info!(
-                        "\n>>>>> {packet}\n => Processing{}",
+                        "\n>>RCV {packet}\n      => Processing{}",
                         if new_exchange { " (new exchange)" } else { "" }
                     );
 
@@ -755,15 +758,13 @@ impl<'m> TransportMgr<'m> {
             // Found a dropped exchange which has no outstanding (re)transmission
             // Send a standalone ACK if necessary and then close it
 
-            let epoch = session_mgr.epoch;
-
             // `unwrap` is safe because we know we have a session and an exchange, or else the early returns from above would've triggered
             let session = session_mgr.get(session_id).unwrap();
             // Ditto
             let exchange = session.exchanges[exch_index].as_mut().unwrap();
 
             if exchange.mrp.is_ack_pending() {
-                self.encode_packet(packet, Some(session), Some(exch_index), epoch, |_| {
+                self.encode_packet(packet, Some(session), Some(exch_index), |_| {
                     Ok(Some(OpCode::MRPStandAloneAck.into()))
                 })?;
             }
@@ -848,7 +849,6 @@ impl<'m> TransportMgr<'m> {
         packet: &mut Packet<N>,
         mut session: Option<&mut Session>,
         exchange_index: Option<usize>,
-        epoch: Epoch,
         payload_writer: F,
     ) -> Result<(), Error>
     where
@@ -872,8 +872,12 @@ impl<'m> TransportMgr<'m> {
         let retransmission = if let Some(session) = &mut session {
             packet.header.plain = Default::default();
 
-            let (peer, retransmission) =
-                session.pre_send(exchange_index, &mut packet.header, epoch)?;
+            let (peer, retransmission) = session.pre_send(
+                exchange_index,
+                &mut packet.header,
+                self.device_sai,
+                self.device_sii,
+            )?;
 
             packet.peer = peer;
 
@@ -903,7 +907,7 @@ impl<'m> TransportMgr<'m> {
         };
 
         info!(
-            "\n<<<<< {}\n => {} (system)",
+            "\n<<SND {}\n      => {} (system)",
             Packet::<0>::display(&packet.peer, &packet.header),
             if retransmission {
                 "Re-sending"
@@ -968,7 +972,7 @@ impl<'m> TransportMgr<'m> {
             session.get_peer_sess_id()
         );
 
-        self.encode_packet(packet, Some(&mut session), None, session_mgr.epoch, |wb| {
+        self.encode_packet(packet, Some(&mut session), None, |wb| {
             sc_write(wb, SCStatusCodes::CloseSession, &[])
         })?;
 
@@ -979,7 +983,7 @@ impl<'m> TransportMgr<'m> {
         let mut pb = ParseBuf::new(payload);
         let report = StatusReport::read(&mut pb)?;
 
-        let close_session = report.proto_id == PROTO_ID_SECURE_CHANNEL as _
+        let close_session = report.proto_id == PROTO_ID_SECURE_CHANNEL as u32
             && report.proto_code == SCStatusCodes::CloseSession as u16;
 
         Ok(close_session)
@@ -991,7 +995,7 @@ impl<'m> TransportMgr<'m> {
     {
         match recv.recv_from(buf).await {
             Ok((len, addr)) => {
-                debug!("\n>>>>> {} {}B:\n{:02x?}", addr, len, &buf[..len]);
+                debug!("\n>>RCV {} {}B:\n     {:02x?}", addr, len, &buf[..len]);
 
                 Ok((len, addr))
             }
@@ -1015,7 +1019,7 @@ impl<'m> TransportMgr<'m> {
         match send.lock().await.send_to(data, peer).await {
             Ok(_) => {
                 debug!(
-                    "\n<<<<< {} {}B{}: {:02x?}",
+                    "\n<<SND {} {}B{}: {:02x?}",
                     peer,
                     data.len(),
                     if system { " (system)" } else { "" },
@@ -1026,11 +1030,10 @@ impl<'m> TransportMgr<'m> {
             }
             Err(e) => {
                 error!(
-                    "\n<<<<< {} {}B{} !FAILED!: {e:?}: {:02x?}",
+                    "\n<<SND {} {}B{} !FAILED!: {e:?}",
                     peer,
                     data.len(),
                     if system { " (system)" } else { "" },
-                    data
                 );
 
                 // Do not return an error as that would unroll the main `rs-matter` loop
@@ -1103,7 +1106,7 @@ impl<const N: usize> Packet<N> {
         if header.proto.is_decoded() {
             let meta = MessageMeta::from(&header.proto);
 
-            write!(f, "\n{meta}")?;
+            write!(f, "\n      {meta}")?;
         }
 
         Ok(())
