@@ -452,6 +452,7 @@ impl<'a> Matter<'a> {
         &self,
         discovery_capabilities: DiscoveryCapabilities,
         timeout_secs: u16,
+        print_pairing_fn: impl Fn(&BasicInfoConfig, &BasicCommData, DiscoveryCapabilities, &mut [u8]) -> Result<(), Error>,
     ) -> Result<(), Error> {
         let buf_access = PacketBufferExternalAccess(&self.transport_mgr.rx);
         let mut buf = buf_access.get().await.ok_or(ErrorCode::NoSpace)?;
@@ -463,7 +464,7 @@ impl<'a> Matter<'a> {
             &mut || self.notify_mdns(),
         )?;
 
-        print_pairing_code_and_qr(
+        print_pairing_fn(
             self.dev_det,
             &self.dev_comm,
             discovery_capabilities,
@@ -497,11 +498,27 @@ impl<'a> Matter<'a> {
         S: NetworkSend,
         R: NetworkReceive,
     {
+        self.run_with_fn(send, recv, discovery_capabilities, print_pairing_code_and_qr)
+            .await
+    }
+
+    /// Run the transport layer with a custom pairing code printing function
+    pub async fn run_with_fn<S, R>(
+        &self,
+        send: S,
+        recv: R,
+        discovery_capabilities: DiscoveryCapabilities,
+        print_pairing_fn: impl Fn(&BasicInfoConfig, &BasicCommData, DiscoveryCapabilities, &mut [u8]) -> Result<(), Error>,
+    ) -> Result<(), Error>
+    where
+        S: NetworkSend,
+        R: NetworkReceive,
+    {
         // TODO: Figure out why chip-tool-tests expect the device to still be in commissioning mode
         // post device reboot, even if it was already commissioned
         if !self.is_commissioned() {
-            self.enable_basic_commissioning(discovery_capabilities, 0 /*TODO*/)
-                .await?;
+            self.enable_basic_commissioning(discovery_capabilities, 0 /*TODO*/, print_pairing_fn)
+            .await?;
         }
 
         self.run_transport(send, recv).await
